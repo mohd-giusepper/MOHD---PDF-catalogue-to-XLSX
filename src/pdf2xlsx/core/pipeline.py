@@ -1,0 +1,502 @@
+import hashlib
+import logging
+import os
+import re
+from pathlib import Path
+from collections import Counter, defaultdict
+from typing import Callable, List, Optional
+
+from pdf2xlsx import config
+from pdf2xlsx.core import extract, normalize, scoring
+from pdf2xlsx.io import json_debug, xlsx_writer
+from pdf2xlsx.models import ProductRow, RunReport
+from pdf2xlsx.parsers import get_parser
+from pdf2xlsx.utils import text as text_utils
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def run_pipeline(
+    input_pdf: str,
+    output_xlsx: str,
+    pages: Optional[List[int]] = None,
+    debug_json: Optional[str] = None,
+    parser_name: Optional[str] = None,
+    debug_blocks: int = 0,
+    currency_only: Optional[str] = None,
+    ocr: bool = False,
+    debug_matches: bool = False,
+    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
+) -> RunReport:
+    parser = get_parser(parser_name or config.DEFAULT_PARSER)
+    source_file = os.path.basename(input_pdf)
+    blocks = []
+    rows: List[ProductRow] = []
+    debug_items: List[dict] = []
+    current_section = ""
+    page_stats: List[dict] = []
+    debug_art_no_samples = 5
+
+    cleanup_output_dir(output_xlsx, debug_json)
+
+    for page in extract.extract_pages(
+        input_pdf, pages, ocr=ocr, progress_callback=progress_callback
+    ):
+        page_stats.append(
+            {
+                "page": page.page_number,
+                "text_len": page.text_len,
+                "images_count": page.images_count,
+                "needs_ocr": page.needs_ocr,
+                "ocr_used": page.ocr_used,
+            }
+        )
+        if page.needs_ocr and not page.ocr_used and ocr is False:
+            LOGGER.info("Page %d flagged for OCR (skipped).", page.page_number)
+        if not page.text:
+            LOGGER.warning("Empty text on page %d", page.page_number)
+            continue
+        normalized = normalize.normalize_text(page.text)
+        if debug_matches and page.page_number in {2, 3}:
+            log_marker_debug(page.page_number, normalized)
+        lines = normalize.split_lines(normalized)
+
+        section = parser.detect_section(lines)
+        if section:
+            current_section = section
+            lines = normalize.strip_section_line(lines, section)
+
+        page_blocks = parser.segment_blocks(lines)
+        for block_text in page_blocks:
+            notes = []
+            has_art_no = parser.contains_art_no(block_text)
+            has_price = bool(parser.price_pattern.search(block_text))
+            if not has_art_no and has_price:
+                if blocks and blocks[-1]["page"] in {page.page_number, page.page_number - 1}:
+                    blocks[-1]["raw_text"] += "\n" + block_text
+                    blocks[-1]["notes"].append("continuation_attached")
+                    continue
+                notes.append("orphan_block_no_art_no")
+            blocks.append(
+                {
+                    "page": page.page_number,
+                    "section": current_section,
+                    "raw_text": block_text,
+                    "ocr_used": page.ocr_used,
+                    "notes": notes,
+                }
+            )
+
+    LOGGER.info("Blocks detected: %d", len(blocks))
+
+    if debug_blocks > 0:
+        print_debug_blocks(blocks, debug_blocks)
+
+    for block in blocks:
+        sub_blocks, merged_note = parser.split_merged_block(block["raw_text"])
+        if merged_note:
+            LOGGER.warning("Possible merged block on page %s", block.get("page"))
+
+        for sub_block in sub_blocks:
+            row, size_unparsed, parse_notes = parser.parse_block(
+                raw_text=sub_block,
+                page=block["page"],
+                section=block["section"],
+                source_file=source_file,
+            )
+            confidence, needs_review, notes = scoring.score_row(
+                row=row,
+                size_unparsed=size_unparsed,
+                ocr_used=block.get("ocr_used", False),
+            )
+
+            normalized_block = normalize.normalize_text(sub_block)
+            raw_block_id = hashlib.sha1(
+                f"{block['page']}:{normalized_block}".encode("utf-8")
+            ).hexdigest()
+            raw_snippet = " ".join(normalized_block.split())[:120]
+
+            row.confidence = confidence
+            row.needs_review = needs_review
+            combined_notes = parse_notes + notes + block.get("notes", [])
+            if merged_note:
+                combined_notes.append(merged_note)
+            row.raw_block_id = raw_block_id
+            row.raw_snippet = raw_snippet
+
+            if row.art_no:
+                row.art_no = text_utils.canonicalize_art_no(row.art_no)
+            if debug_art_no_samples > 0 and row.art_no_raw:
+                LOGGER.info(
+                    "art_no_raw=%s art_no_canonical=%s",
+                    row.art_no_raw,
+                    row.art_no,
+                )
+                debug_art_no_samples -= 1
+
+            target_currency = (currency_only or "EUR").upper()
+            invalid_price_note = f"invalid_price_{target_currency.lower()}"
+            force_review = merged_note in {"merged_block_unsplit", "possible_merged_block"}
+            if invalid_price_note in parse_notes or "invalid_price_eur" in parse_notes:
+                force_review = True
+
+            art_no_count = len(parser.art_no_regex.findall(sub_block))
+            has_any_price = bool(parser.price_pattern.search(sub_block))
+            invalid_reasons = []
+            if art_no_count == 0 or not row.art_no:
+                invalid_reasons.append("invalid_chunk_missing_art_no")
+            elif art_no_count > 1:
+                invalid_reasons.append("invalid_chunk_multiple_art_no")
+            if not has_any_price:
+                invalid_reasons.append("invalid_chunk_missing_price")
+            if not row.product_name_en:
+                invalid_reasons.append("invalid_chunk_missing_name")
+            if invalid_reasons:
+                row.exported = False
+                row.needs_review = True
+                combined_notes.extend(invalid_reasons)
+
+            if target_currency == "EUR" and row.price_eur is None:
+                combined_notes.append("missing_price_eur")
+                row.needs_review = True
+
+            if is_degraded_art_no(sub_block, row.art_no):
+                combined_notes.append("art_no_degraded")
+                row.needs_review = True
+
+            row.notes = "; ".join(unique_notes(combined_notes))
+            if force_review:
+                row.needs_review = True
+
+            if currency_only:
+                apply_currency_filter(row, currency_only)
+
+            rows.append(row)
+
+            if debug_json:
+                debug_items.append(
+                    {
+                        "page": block["page"],
+                        "section": block["section"],
+                        "ocr_used": block.get("ocr_used", False),
+                        "raw_block_id": raw_block_id,
+                        "raw_snippet": raw_snippet,
+                        "raw_text": sub_block,
+                        "row_index": len(rows) - 1,
+                    }
+                )
+
+    apply_duplicate_policy(rows, currency_only or "EUR")
+    ensure_review_for_missing_prices(rows, currency_only or "EUR")
+
+    if debug_json:
+        for item in debug_items:
+            row_index = item.pop("row_index", None)
+            if isinstance(row_index, int) and 0 <= row_index < len(rows):
+                item["parsed"] = rows[row_index].to_dict()
+        json_debug.write_debug_json(
+            debug_json, {"pages": page_stats, "blocks": debug_items}
+        )
+
+    xlsx_writer.write_xlsx(rows, output_xlsx)
+
+    needs_review_count = sum(1 for row in rows if row.needs_review)
+    LOGGER.info("Rows written: %d", len(rows))
+    if rows:
+        LOGGER.info(
+            "Needs review: %d (%.1f%%)",
+            needs_review_count,
+            100.0 * needs_review_count / len(rows),
+        )
+    LOGGER.info("Output saved to %s", output_xlsx)
+
+    return build_report(rows, page_stats, currency_only)
+
+
+def build_report(
+    rows: List[ProductRow],
+    page_stats: List[dict],
+    currency_only: Optional[str],
+) -> RunReport:
+    target_currency = (currency_only or "EUR").upper()
+    exported_rows = [row for row in rows if row.exported]
+    missing_price = sum(
+        1
+        for row in exported_rows
+        if get_price_by_currency(row, target_currency) is None
+    )
+
+    duplicate_summary = analyze_duplicates(rows, target_currency)
+    review_reasons = analyze_review_reasons(rows)
+
+    report = RunReport(
+        rows=rows,
+        pages_processed=len(page_stats),
+        pages_needing_ocr=sum(1 for p in page_stats if p.get("needs_ocr")),
+        pages_ocr_used=sum(1 for p in page_stats if p.get("ocr_used")),
+        rows_needs_review=sum(1 for row in rows if row.needs_review),
+        missing_art_no=sum(1 for row in rows if not row.art_no),
+        missing_price=missing_price,
+        rows_exported=len(exported_rows),
+        duplicate_art_no_count=duplicate_summary["count"],
+        duplicate_art_no_top=duplicate_summary["top"],
+        duplicate_conflicts=duplicate_summary["conflicts"],
+        duplicate_conflicts_count=duplicate_summary["conflicts_count"],
+        review_reasons_top=review_reasons,
+        target_currency=target_currency,
+        examples_ok=[row for row in rows if not row.needs_review][:3],
+        examples_needs_review=[row for row in rows if row.needs_review][:3],
+        page_stats=page_stats,
+        config_info={
+            "threshold_text_len_for_ocr": config.THRESHOLD_TEXT_LEN_FOR_OCR,
+            "confidence_threshold": config.CONFIDENCE_THRESHOLD,
+            "price_min": config.PRICE_MIN,
+            "price_max": config.PRICE_MAX,
+            "review_rate_threshold": config.REVIEW_RATE_THRESHOLD,
+        },
+    )
+    return report
+
+
+def analyze_duplicates(rows: List[ProductRow], target_currency: str) -> dict:
+    art_nos = [text_utils.canonicalize_art_no(row.art_no) for row in rows if row.art_no]
+    counter = Counter(art_nos)
+    duplicates = [(art_no, count) for art_no, count in counter.items() if count > 1]
+    duplicates.sort(key=lambda item: (-item[1], item[0]))
+
+    conflicts = []
+    grouped = defaultdict(list)
+    for row in rows:
+        if row.art_no:
+            normalized = text_utils.canonicalize_art_no(row.art_no)
+            grouped[normalized].append(row)
+
+    for art_no, group_rows in grouped.items():
+        if len(group_rows) < 2:
+            continue
+        values = set(
+            (
+                row.product_name_en.strip().lower(),
+                get_price_by_currency(row, target_currency),
+            )
+            for row in group_rows
+        )
+        if len(values) > 1:
+            conflicts.append(art_no)
+            LOGGER.warning(
+                "Duplicate art_no conflict: %s (variants: %d)", art_no, len(values)
+            )
+
+    return {
+        "count": len(duplicates),
+        "top": duplicates[:10],
+        "conflicts": conflicts,
+        "conflicts_count": len(conflicts),
+    }
+
+
+def cleanup_output_dir(output_xlsx: str, debug_json: Optional[str]) -> None:
+    output_root = Path(config.OUTPUT_DIR).resolve()
+    output_path = Path(output_xlsx).resolve()
+    target_dir = output_path.parent
+
+    if output_root not in [target_dir, *target_dir.parents]:
+        return
+
+    keep = {output_path}
+    if debug_json:
+        keep.add(Path(debug_json).resolve())
+
+    patterns = ["*.xlsx", f"*{config.DEBUG_JSON_SUFFIX}"]
+    for pattern in patterns:
+        for path in target_dir.glob(pattern):
+            if path.resolve() in keep:
+                continue
+            try:
+                path.unlink()
+                LOGGER.info("Removed old output file: %s", path)
+            except OSError:
+                LOGGER.warning("Could not remove old output file: %s", path)
+
+
+def analyze_review_reasons(rows: List[ProductRow]) -> List[tuple]:
+    counter: Counter = Counter()
+    for row in rows:
+        if not row.needs_review and row.exported:
+            continue
+        if not row.notes:
+            counter["unspecified"] += 1
+            continue
+        for note in row.notes.split(";"):
+            reason = note.strip()
+            if reason:
+                counter[reason] += 1
+    return counter.most_common(5)
+
+
+def unique_notes(notes: List[str]) -> List[str]:
+    seen = set()
+    unique = []
+    for note in notes:
+        clean = note.strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        unique.append(clean)
+    return unique
+
+
+def is_degraded_art_no(raw_text: str, art_no: str) -> bool:
+    if not art_no or "-" in art_no:
+        return False
+    if not art_no.isdigit():
+        return False
+    if len(art_no) < 4:
+        return False
+    return bool(
+        re.search(
+            r"Art\.?\s*no\.?\s*:\s*\d+\s*[-\u00ad]\s*\d+",
+            raw_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def ensure_review_for_missing_prices(rows: List[ProductRow], currency: str) -> None:
+    currency = currency.upper()
+    for row in rows:
+        if not row.exported:
+            continue
+        if currency == "EUR" and row.price_eur is None:
+            add_row_note(row, "missing_price_eur")
+            row.needs_review = True
+
+
+def apply_duplicate_policy(rows: List[ProductRow], currency: str) -> None:
+    currency = currency.upper()
+    grouped = defaultdict(list)
+    for row in rows:
+        if row.art_no:
+            key = text_utils.canonicalize_art_no(row.art_no)
+            row.art_no = key
+            grouped[key].append(row)
+
+    conflicts = set()
+    for art_no, group_rows in grouped.items():
+        if len(group_rows) < 2:
+            continue
+        values = set(
+            (
+                row.product_name_en.strip().lower(),
+                get_price_by_currency(row, currency),
+            )
+            for row in group_rows
+        )
+        if len(values) > 1:
+            conflicts.add(art_no)
+
+    for art_no, group_rows in grouped.items():
+        if len(group_rows) < 2:
+            continue
+        if art_no in conflicts:
+            for row in group_rows:
+                row.exported = False
+                row.needs_review = True
+                add_row_note(row, "duplicate_conflict")
+            continue
+
+        best_row = select_best_row(group_rows, currency)
+        for row in group_rows:
+            if row is best_row:
+                continue
+            row.exported = False
+            row.needs_review = True
+            add_row_note(row, "duplicate_art_no")
+
+
+def select_best_row(rows: List[ProductRow], currency: str) -> ProductRow:
+    return max(rows, key=lambda row: row_score(row, currency))
+
+
+def row_score(row: ProductRow, currency: str) -> int:
+    score = 0
+    if row.product_name_en:
+        score += 3
+    if get_price_by_currency(row, currency) is not None:
+        score += 3
+    if row.designer:
+        score += 1
+    if row.size_raw:
+        score += 1
+    if row.variant:
+        score += 1
+    if row.colli is not None:
+        score += 1
+    if row.section:
+        score += 1
+    if row.needs_review:
+        score -= 2
+    if not row.exported:
+        score -= 2
+    return score
+
+
+def add_row_note(row: ProductRow, note: str) -> None:
+    if not note:
+        return
+    existing = [item.strip() for item in row.notes.split(";") if item.strip()]
+    if note not in existing:
+        existing.append(note)
+        row.notes = "; ".join(existing)
+
+
+def log_marker_debug(page_number: int, text: str) -> None:
+    rrp_matches = list(re.finditer(r"\*\*\s*RRP", text))
+    art_matches = list(re.finditer(r"\bArt\.?\s*no\.?\s*:", text, re.IGNORECASE))
+    LOGGER.info(
+        "Page %d markers: rrp=%d art_no=%d",
+        page_number,
+        len(rrp_matches),
+        len(art_matches),
+    )
+
+    for label, matches in (("RRP", rrp_matches), ("ART", art_matches)):
+        for match in matches[:5]:
+            start = max(0, match.start() - 30)
+            end = min(len(text), match.end() + 30)
+            snippet = text[start:end].replace("\n", " ")
+            LOGGER.info("%s match: ...%s...", label, snippet)
+
+
+def get_price_by_currency(row: ProductRow, currency: str) -> Optional[float]:
+    currency = currency.upper()
+    if currency == "DKK":
+        return row.price_dkk
+    if currency == "SEK":
+        return row.price_sek
+    if currency == "NOK":
+        return row.price_nok
+    return row.price_eur
+
+
+def apply_currency_filter(row: ProductRow, currency_only: str) -> None:
+    currency_only = currency_only.upper()
+    if currency_only != "DKK":
+        row.price_dkk = None
+    if currency_only != "SEK":
+        row.price_sek = None
+    if currency_only != "NOK":
+        row.price_nok = None
+    if currency_only != "EUR":
+        row.price_eur = None
+
+
+def print_debug_blocks(blocks: List[dict], count: int) -> None:
+    print("\nDEBUG BLOCKS (raw)")
+    for idx, block in enumerate(blocks[:count], start=1):
+        print("=" * 80)
+        print(f"BLOCK {idx} - page {block.get('page')} - section {block.get('section')}")
+        print("-" * 80)
+        print(block.get("raw_text", ""))
+    print("=" * 80)
