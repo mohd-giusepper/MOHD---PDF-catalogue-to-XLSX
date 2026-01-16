@@ -4,12 +4,13 @@ import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from pdf2xlsx import config
-from pdf2xlsx.core import auto_convert, debug_pack as debug_pack_utils, pipeline, profile_enrich, triage
-from pdf2xlsx.io import triage_report
+from pdf2xlsx.core import auto_convert, triage
+from pdf2xlsx.io.run_debug import RunDebugCollector
 from pdf2xlsx.logging_setup import configure_logging
+from pdf2xlsx.models import TriageResult
 
 
 class App:
@@ -17,26 +18,25 @@ class App:
         configure_logging("INFO")
 
         self.root = tk.Tk()
-        self.root.title("Giuseppe Rubino - PDF to XLSX Converter")
+        self.root.title("PDF Catalog Parser")
+        self.root.minsize(980, 640)
 
-        self.input_var = tk.StringVar()
-        self.output_var = tk.StringVar()
-        self.input_mode = tk.StringVar(value="folder")
-        self.debug_var = tk.BooleanVar(value=False)
-        self.ocr_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="Ready")
-        self.summary_var = tk.StringVar(value="Nessuna scansione eseguita.")
         self._queue: queue.Queue = queue.Queue()
         self._worker: Optional[threading.Thread] = None
-        self.triage_results = []
         self.stop_event = threading.Event()
-        self.scan_done = False
+
+        self.scan_results: List[TriageResult] = []
+        self._row_items: List[str] = []
+        self._progress_target = 0
+        self._progress_value = 0
+        self._progress_animating = False
+
+        self.debug_var = tk.BooleanVar(value=config.DEBUG_JSON_DEFAULT)
+        self.status_var = tk.StringVar(value="Seleziona file o cartella per iniziare.")
+        self._run_debug: Optional[RunDebugCollector] = None
 
         self._setup_style()
         self._build_ui()
-        self._update_action_buttons()
-        self._update_scan_label()
-        self.input_mode.trace_add("write", lambda *_: self._update_scan_label())
         self._poll_queue()
 
     def _setup_style(self) -> None:
@@ -45,159 +45,113 @@ class App:
         theme = "clam" if "clam" in style.theme_names() else style.theme_use()
         style.theme_use(theme)
 
-        self._bg = "#f6f7fb"
+        self._bg = "#f5f6f8"
         self._card = "#ffffff"
-        self._text = "#0f172a"
+        self._text = "#111827"
         self._muted = "#6b7280"
-        self._accent = "#2563eb"
-        self._accent_hover = "#1d4ed8"
+        self._accent = "#111827"
+        self._accent_hover = "#1f2937"
 
         self.root.configure(bg=self._bg)
         style.configure("TFrame", background=self._bg)
         style.configure("TLabel", background=self._bg, foreground=self._text)
         style.configure("TCheckbutton", background=self._bg, foreground=self._text)
         style.configure("TEntry", fieldbackground=self._card, foreground=self._text)
-        style.configure("Accent.TButton", padding=(10, 6), background=self._accent, foreground="#ffffff")
+        style.configure("Card.TFrame", background=self._card)
+        style.configure("Card.TLabelframe", background=self._card)
+        style.configure("Card.TLabelframe.Label", background=self._bg, foreground=self._text)
+        style.configure(
+            "Accent.TButton",
+            padding=(10, 6),
+            background=self._accent,
+            foreground="#ffffff",
+        )
         style.map(
             "Accent.TButton",
             background=[("active", self._accent_hover), ("pressed", self._accent_hover)],
-            foreground=[("disabled", "#cbd5f5")],
+            foreground=[("disabled", "#d1d5db")],
         )
         style.configure(
             "Accent.Horizontal.TProgressbar",
             troughcolor=self._card,
-            background=self._accent,
+            background="#2ea043",
             thickness=8,
         )
 
     def _build_ui(self) -> None:
-        form = ttk.Frame(self.root, padding=10)
-        form.pack(fill="x")
-
-        input_frame = ttk.LabelFrame(form, text="Input", padding=10)
-        input_frame.pack(fill="x", pady=6)
-        mode_row = ttk.Frame(input_frame)
-        mode_row.pack(fill="x", pady=2)
-        ttk.Label(mode_row, text="Modalita").pack(side="left")
-        ttk.Radiobutton(
-            mode_row, text="File singolo", variable=self.input_mode, value="file"
-        ).pack(side="left", padx=6)
-        ttk.Radiobutton(
-            mode_row, text="Cartella", variable=self.input_mode, value="folder"
-        ).pack(side="left", padx=6)
-        self._add_row(input_frame, "Input", self.input_var, None)
-        browse_row = ttk.Frame(input_frame)
-        browse_row.pack(fill="x", pady=2)
-        ttk.Button(browse_row, text="Sfoglia file", command=self._browse_input_file).pack(
-            side="left"
+        header = ttk.Frame(self.root, padding=(16, 12, 16, 6))
+        header.pack(fill="x")
+        ttk.Label(header, text="PDF Catalog Parser", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w"
         )
-        ttk.Button(
-            browse_row, text="Sfoglia cartella", command=self._browse_input_folder
-        ).pack(side="left", padx=6)
+        ttk.Label(
+            header,
+            text="Carica PDF, analizza e converti OK/FORSE.",
+            foreground=self._muted,
+        ).pack(anchor="w")
 
-        output_frame = ttk.LabelFrame(form, text="Output", padding=10)
-        output_frame.pack(fill="x", pady=6)
-        self._add_row(output_frame, "Output XLSX", self.output_var, self._browse_output)
+        main = ttk.Frame(self.root, padding=(16, 6, 16, 8))
+        main.pack(fill="both", expand=True)
 
-        debug_frame = ttk.Frame(form)
-        debug_frame.pack(fill="x", pady=4)
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="y", padx=(0, 12))
+
+        right = ttk.Frame(main)
+        right.pack(side="right", fill="both", expand=True)
+
+        actions = ttk.LabelFrame(left, text="Azioni", padding=12)
+        actions.pack(fill="y", expand=False)
+
+        self.load_single_btn = ttk.Button(
+            actions, text="Carica PDF singolo", command=self._load_single
+        )
+        self.load_single_btn.pack(fill="x", pady=(0, 6))
+        self.load_folder_btn = ttk.Button(
+            actions, text="Carica cartella input", command=self._load_folder
+        )
+        self.load_folder_btn.pack(fill="x", pady=(0, 6))
+        self.convert_btn = ttk.Button(
+            actions, text="Converti", command=self._convert_loaded, style="Accent.TButton"
+        )
+        self.convert_btn.pack(fill="x", pady=(0, 10))
+
+        self.stop_btn = ttk.Button(actions, text="Stop", command=self._request_stop)
+        self.stop_btn.pack(fill="x")
+
+        ttk.Separator(actions).pack(fill="x", pady=10)
         ttk.Checkbutton(
-            debug_frame, text="Debug JSON", variable=self.debug_var
-        ).pack(side="left")
-        ttk.Checkbutton(
-            debug_frame,
-            text="OCR fallback (solo pagine scansione)",
-            variable=self.ocr_var,
-        ).pack(side="left", padx=8)
+            actions, text="Debug", variable=self.debug_var
+        ).pack(anchor="w")
 
-        button_frame = ttk.LabelFrame(form, text="Azioni", padding=10)
-        button_frame.pack(fill="x", pady=6)
-        self.scan_button = ttk.Button(
-            button_frame,
-            text="Scansiona cartella",
-            command=self._run_triage_scan,
-        )
-        self.scan_button.pack(side="left")
-        self.convert_button = ttk.Button(
-            button_frame,
-            text="Converti solo OK",
-            command=self._run_auto_convert,
-            style="Accent.TButton",
-        )
-        self.convert_button.pack(side="right")
-        self.enrich_button = ttk.Button(
-            button_frame,
-            text="Arricchisci profili",
-            command=self._run_profile_enrich,
-        )
-        self.enrich_button.pack(side="right", padx=6)
-        self.stop_button = ttk.Button(
-            button_frame,
-            text="Stop",
-            command=self._request_stop,
-        )
-        self.stop_button.pack(side="right", padx=6)
-        self.stop_button.configure(state="disabled")
-
-        progress_frame = ttk.Frame(self.root, padding=(10, 0, 10, 6))
-        progress_frame.pack(fill="x")
-        self.progress = ttk.Progressbar(
-            progress_frame,
-            orient="horizontal",
-            mode="determinate",
-            style="Accent.Horizontal.TProgressbar",
-        )
-        self.progress.pack(fill="x")
-
-        triage_frame = ttk.LabelFrame(self.root, text="Risultati scan", padding=(10, 6))
-        triage_frame.pack(fill="both", expand=False)
-        ttk.Label(triage_frame, textvariable=self.summary_var).pack(anchor="w")
+        results = ttk.LabelFrame(right, text="File caricati", padding=8)
+        results.pack(fill="both", expand=True)
         self.triage_tree = ttk.Treeview(
-            triage_frame,
-            columns=(
-                "file",
-                "decision",
-                "profile",
-                "score",
-                "status",
-                "parser",
-                "attempts",
-                "reason",
-            ),
+            results,
+            columns=("file", "decision", "parser", "note"),
             show="headings",
-            height=6,
         )
         self.triage_tree.heading("file", text="File")
         self.triage_tree.heading("decision", text="Decisione")
-        self.triage_tree.heading("profile", text="Profilo suggerito")
-        self.triage_tree.heading("score", text="Score")
-        self.triage_tree.heading("status", text="Status")
         self.triage_tree.heading("parser", text="Parser")
-        self.triage_tree.heading("attempts", text="Tentativi")
-        self.triage_tree.heading("reason", text="Motivo")
-        self.triage_tree.column("file", width=200, anchor="w")
-        self.triage_tree.column("decision", width=70, anchor="center")
-        self.triage_tree.column("profile", width=130, anchor="center")
-        self.triage_tree.column("score", width=60, anchor="center")
-        self.triage_tree.column("status", width=120, anchor="center")
-        self.triage_tree.column("parser", width=120, anchor="center")
-        self.triage_tree.column("attempts", width=80, anchor="center")
-        self.triage_tree.column("reason", width=200, anchor="w")
+        self.triage_tree.heading("note", text="Nota")
+        self.triage_tree.column("file", width=320, anchor="w")
+        self.triage_tree.column("decision", width=90, anchor="center")
+        self.triage_tree.column("parser", width=140, anchor="center")
+        self.triage_tree.column("note", width=260, anchor="w")
         self.triage_tree.tag_configure("ok", foreground="#15803d")
         self.triage_tree.tag_configure("maybe", foreground="#b45309")
         self.triage_tree.tag_configure("no", foreground="#b91c1c")
-        self.triage_tree.tag_configure("converted", foreground="#1d4ed8")
-        tree_scroll = ttk.Scrollbar(triage_frame, orient="vertical", command=self.triage_tree.yview)
+        self.triage_tree.tag_configure("pending", foreground=self._muted)
+        tree_scroll = ttk.Scrollbar(results, orient="vertical", command=self.triage_tree.yview)
         self.triage_tree.configure(yscrollcommand=tree_scroll.set)
         self.triage_tree.pack(side="left", fill="both", expand=True)
         tree_scroll.pack(side="right", fill="y")
 
-        log_frame = ttk.Frame(self.root, padding=(10, 6))
-        log_frame.pack(fill="both", expand=True)
-        ttk.Label(log_frame, text="Log").pack(anchor="w")
+        log_frame = ttk.LabelFrame(self.root, text="Log", padding=8)
+        log_frame.pack(fill="both", padx=16, pady=(0, 8))
         self.log_area = scrolledtext.ScrolledText(
             log_frame,
-            height=8,
+            height=6,
             state="disabled",
             bg=self._card,
             fg=self._text,
@@ -206,58 +160,20 @@ class App:
         )
         self.log_area.pack(fill="both", expand=True)
 
-        status_frame = ttk.Frame(self.root, padding=(10, 6))
-        status_frame.pack(fill="x")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(anchor="w")
-
-    def _add_row(
-        self,
-        parent: tk.Misc,
-        label: str,
-        variable: tk.StringVar,
-        browse_callback,
-    ) -> None:
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=4)
-        ttk.Label(row, text=label, width=12, anchor="w").pack(side="left")
-        entry = ttk.Entry(row, textvariable=variable)
-        entry.pack(side="left", fill="x", expand=True)
-        if browse_callback:
-            ttk.Button(row, text="Browse", command=browse_callback).pack(
-                side="left", padx=4
-            )
-
-    def _browse_input(self) -> None:
-        return
-
-    def _browse_input_file(self) -> None:
-        path = filedialog.askopenfilename(
-            initialdir=config.INPUT_DIR,
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        footer = ttk.Frame(self.root, padding=(16, 0, 16, 12))
+        footer.pack(fill="x")
+        self.progress = ttk.Progressbar(
+            footer,
+            orient="horizontal",
+            mode="determinate",
+            style="Accent.Horizontal.TProgressbar",
         )
-        if path:
-            self.input_mode.set("file")
-            self.input_var.set(path)
-            if not self.output_var.get().strip():
-                output_dir = os.path.join(os.getcwd(), config.OUTPUT_DIR)
-                os.makedirs(output_dir, exist_ok=True)
-                stem = os.path.splitext(os.path.basename(path))[0]
-                self.output_var.set(os.path.join(output_dir, f"{stem}.xlsx"))
-
-    def _browse_input_folder(self) -> None:
-        path = filedialog.askdirectory(initialdir=config.INPUT_DIR)
-        if path:
-            self.input_mode.set("folder")
-            self.input_var.set(path)
-
-    def _browse_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            initialdir=config.OUTPUT_DIR,
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx")],
+        self.progress.pack(fill="x", pady=(0, 6))
+        ttk.Label(footer, textvariable=self.status_var, foreground=self._muted).pack(
+            anchor="w"
         )
-        if path:
-            self.output_var.set(path)
+
+        self._set_busy(False)
 
     def _log(self, message: str) -> None:
         self.log_area.configure(state="normal")
@@ -265,424 +181,243 @@ class App:
         self.log_area.configure(state="disabled")
         self.log_area.see(tk.END)
 
-    def _run_job(self) -> None:
-        input_path = self.input_var.get().strip()
-        output_path = self.output_var.get().strip()
-
-        if not input_path:
-            messagebox.showerror("Missing input", "Select input and output files.")
-            return
-        if not os.path.exists(input_path):
-            messagebox.showerror("Missing input", "Input PDF not found.")
-            return
-        if not output_path:
-            output_dir = os.path.join(os.getcwd(), config.OUTPUT_DIR)
-            os.makedirs(output_dir, exist_ok=True)
-            stem = os.path.splitext(os.path.basename(input_path))[0]
-            output_path = os.path.join(output_dir, f"{stem}.xlsx")
-            self.output_var.set(output_path)
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-
-        debug_json = None
-        if self.debug_var.get():
-            debug_json = output_path + config.DEBUG_JSON_SUFFIX
-
-        self._set_busy(True)
-        self.progress["value"] = 0
-        self.status_var.set("Running...")
-        self._log("Starting conversion...")
-
-        args = {
-            "input_pdf": input_path,
-            "output_xlsx": output_path,
-            "pages": None,
-            "debug_json": debug_json,
-            "parser_name": config.DEFAULT_PARSER,
-            "ocr": self.ocr_var.get(),
-            "progress_callback": self._progress_callback,
-            "currency_only": config.TARGET_CURRENCY,
-        }
-
-        self._worker = threading.Thread(
-            target=self._run_job_background, args=(args,), daemon=True
-        )
-        self._worker.start()
-
-    def _run_job_background(self, args: dict) -> None:
-        try:
-            report = pipeline.run_pipeline(**args)
-        except Exception as exc:
-            self._queue.put(("error", str(exc)))
-        else:
-            self._queue.put(("done", report, args.get("debug_json")))
-
-    def _run_triage_scan(self) -> None:
-        target_path, is_file = self._resolve_input_target()
-        if is_file and not os.path.isfile(target_path):
-            messagebox.showerror("Missing input", f"Input file not found: {target_path}")
-            return
-        if not is_file and not os.path.isdir(target_path):
-            messagebox.showerror("Missing input", f"Input folder not found: {target_path}")
-            return
-        output_dir = self._resolve_output_dir()
-        os.makedirs(output_dir, exist_ok=True)
-        report_path = os.path.join(output_dir, "triage_report.xlsx")
-
-        self._set_busy(True)
-        self.progress["value"] = 0
-        self.status_var.set("Scanning...")
-        label = "file" if is_file else "folder"
-        self._log(f"Scanning {label}: {target_path}")
-        self.stop_event.clear()
-
-        args = {
-            "target_path": target_path,
-            "is_file": is_file,
-            "output_dir": output_dir,
-            "report_path": report_path,
-            "ocr": self.ocr_var.get(),
-            "debug_pack_dir": config.DEBUG_PACK_DIR,
-            "debug_level": "light",
-        }
-        self._worker = threading.Thread(
-            target=self._run_triage_scan_background, args=(args,), daemon=True
-        )
-        self._worker.start()
-
-    def _run_triage_scan_background(self, args: dict) -> None:
-        results = []
-        debug_pack = None
-        input_files = []
-        try:
-            if args["is_file"]:
-                input_files = [Path(args["target_path"])]
-            else:
-                input_files = sorted(Path(args["target_path"]).glob("*.pdf"))
-            mode = "single" if len(input_files) == 1 else "batch"
-            debug_pack = debug_pack_utils.DebugPack(
-                base_dir=args["debug_pack_dir"],
-                input_files=input_files,
-                mode=mode,
-                level=args["debug_level"],
-                target_currency=config.TARGET_CURRENCY,
-            )
-            self._queue.put(("log", f"Debug pack: {debug_pack.root}"))
-
-            if args["is_file"]:
-                results = [triage.scan_pdf(args["target_path"], ocr=args["ocr"])]
-            else:
-                results = triage.scan_folder(
-                    args["target_path"],
-                    ocr=args["ocr"],
-                    progress_callback=self._triage_progress_callback,
-                    should_stop=self.stop_event.is_set,
-                )
-            triage_report.write_triage_report(results, args["report_path"])
-            if not args["is_file"]:
-                pdf_count = len(
-                    [
-                        name
-                        for name in os.listdir(args["target_path"])
-                        if name.lower().endswith(".pdf")
-                    ]
-                )
-                if len(results) != pdf_count:
-                    self._queue.put(
-                        (
-                            "log",
-                            "WARNING: triage report rows "
-                            f"({len(results)}) != scanned PDFs ({pdf_count})",
-                        )
-                    )
-            if debug_pack:
-                for result in results:
-                    debug_pack.write_pdf_pack(result)
-                debug_pack.write_triage_report(results)
-        except Exception as exc:
-            if debug_pack:
-                debug_pack.write_triage_report(results)
-                partial = len(results) != len(input_files)
-                debug_pack.finalize(results, partial_run=partial or True)
-            self._queue.put(("error", str(exc)))
-            return
-        finally:
-            if debug_pack:
-                debug_pack.write_triage_report(results)
-                partial = self.stop_event.is_set() or len(results) != len(input_files)
-                debug_pack.finalize(results, partial_run=partial)
-        self._queue.put(
-            ("triage_done", results, args["report_path"], self.stop_event.is_set())
-        )
-
-    def _run_auto_convert(self) -> None:
-        if not self.scan_done:
-            messagebox.showerror("Missing scan", "Run 'Scansiona cartella' first.")
-            return
-        ok_targets = [
-            result for result in self.triage_results if result.decision == "OK"
-        ]
-        if not ok_targets:
-            messagebox.showinfo("No OK files", "No OK files to convert.")
-            return
-        output_dir = self._resolve_output_dir()
-        os.makedirs(output_dir, exist_ok=True)
-        report_path = os.path.join(output_dir, "triage_report.xlsx")
-
-        self._set_busy(True)
-        self.progress["value"] = 0
-        self.status_var.set("Converting (auto)...")
-        self._log("Auto converting OK files...")
-        self.stop_event.clear()
-
-        args = {
-            "targets": ok_targets,
-            "output_dir": output_dir,
-            "report_path": report_path,
-            "ocr": self.ocr_var.get(),
-            "debug_pack_dir": config.DEBUG_PACK_DIR,
-            "debug_level": "light",
-        }
-        self._worker = threading.Thread(
-            target=self._run_auto_convert_background, args=(args,), daemon=True
-        )
-        self._worker.start()
-
-    def _run_auto_convert_background(self, args: dict) -> None:
-        results = []
-        debug_pack = None
-        input_files = [Path(result.source_path) for result in args["targets"]]
-        try:
-            mode = "single" if len(input_files) == 1 else "batch"
-            debug_pack = debug_pack_utils.DebugPack(
-                base_dir=args["debug_pack_dir"],
-                input_files=input_files,
-                mode=mode,
-                level=args["debug_level"],
-                target_currency=config.TARGET_CURRENCY,
-            )
-            self._queue.put(("log", f"Debug pack: {debug_pack.root}"))
-
-            total = len(args["targets"])
-            for idx, result in enumerate(args["targets"], start=1):
-                if self.stop_event.is_set():
-                    break
-                self._triage_progress_callback(idx - 1, total, result.source_file)
-                converted = auto_convert.run_auto_for_pdf(
-                    pdf_path=result.source_path,
-                    output_dir=args["output_dir"],
-                    ocr=args["ocr"],
-                    currency=config.TARGET_CURRENCY,
-                    currency_only=None,
-                )
-                results.append(converted)
-                triage_report.write_triage_report(results, args["report_path"])
-                if debug_pack:
-                    debug_pack.write_pdf_pack(converted)
-                    debug_pack.write_triage_report(results)
-                self._triage_progress_callback(idx, total, result.source_file)
-        except Exception as exc:
-            if debug_pack:
-                debug_pack.write_triage_report(results)
-                partial = len(results) != len(input_files)
-                debug_pack.finalize(results, partial_run=partial or True)
-            self._queue.put(("error", str(exc)))
-            return
-        finally:
-            if debug_pack:
-                debug_pack.write_triage_report(results)
-                partial = self.stop_event.is_set() or len(results) != len(input_files)
-                debug_pack.finalize(results, partial_run=partial)
-
-        self._queue.put(
-            (
-                "triage_convert_done",
-                results,
-                args["report_path"],
-                self._summarize_conversions(results),
-                self.stop_event.is_set(),
-            )
-        )
-
-    def _progress_callback(
-        self, processed: int, total: int, page_number: int, pdf_total: int
-    ) -> None:
-        self._queue.put(
-            ("progress", processed, total, page_number, pdf_total)
-        )
-
-    def _triage_progress_callback(self, processed: int, total: int, filename: str) -> None:
-        self._queue.put(("triage_progress", processed, total, filename))
-
-    def _resolve_input_target(self) -> tuple[str, bool]:
-        input_path = self.input_var.get().strip()
-        if self.input_mode.get() == "file":
-            if input_path:
-                return input_path, True
-            return "", True
-        if input_path:
-            return input_path, False
-        return os.path.join(os.getcwd(), config.INPUT_DIR), False
-
-    def _resolve_output_dir(self) -> str:
-        output_path = self.output_var.get().strip()
-        if output_path:
-            if output_path.lower().endswith(".xlsx"):
-                return os.path.dirname(output_path)
-            return output_path
-        return os.path.join(os.getcwd(), config.OUTPUT_DIR)
-
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        self.scan_button.configure(state=state)
-        if busy:
-            self.convert_button.configure(state="disabled")
-            self.enrich_button.configure(state="disabled")
-        else:
-            self._update_action_buttons()
-        self.stop_button.configure(state="normal" if busy else "disabled")
+        self.load_single_btn.configure(state=state)
+        self.load_folder_btn.configure(state=state)
+        self.convert_btn.configure(state=state if self._has_convertible() else "disabled")
+        self.stop_btn.configure(state="normal" if busy else "disabled")
+
+    def _has_convertible(self) -> bool:
+        return any(result.decision in {"OK", "FORSE"} for result in self.scan_results)
 
     def _request_stop(self) -> None:
         if not self.stop_event.is_set():
             self.stop_event.set()
-            self.status_var.set("Stopping...")
-            self._log("Stop requested.")
+            self.status_var.set("Stop richiesto...")
+            self._log("Stop richiesto.")
 
-    def _summarize_conversions(self, results) -> dict:
-        summary = {"processed_ok": 0, "failed": 0, "skipped": 0}
-        for result in results:
-            status = result.final_status or ""
-            if status.startswith("CONVERTED"):
-                summary["processed_ok"] += 1
-            elif status.startswith("FAILED"):
-                summary["failed"] += 1
-            elif status.startswith("SKIPPED"):
-                summary["skipped"] += 1
-        return summary
-
-    def _format_summary(self) -> str:
-        if not self.triage_results:
-            return "Nessun risultato."
-        counts = {"OK": 0, "FORSE": 0, "NO": 0}
-        converted = 0
-        partial = 0
-        failed = 0
-        for result in self.triage_results:
-            counts[result.decision] = counts.get(result.decision, 0) + 1
-            status = result.final_status or ""
-            if status.startswith("CONVERTED"):
-                converted += 1
-            elif status.startswith("PARTIAL"):
-                partial += 1
-            elif status.startswith("FAILED"):
-                failed += 1
-        return (
-            f"OK={counts['OK']} | FORSE={counts['FORSE']} | NO={counts['NO']} | "
-            f"CONVERTED={converted} | PARTIAL={partial} | FAILED={failed}"
+    def _pick_file(self) -> str:
+        return filedialog.askopenfilename(
+            initialdir=config.INPUT_DIR,
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
 
-    def _render_triage_results(self) -> None:
-        for item in self.triage_tree.get_children():
-            self.triage_tree.delete(item)
-        for result in self.triage_results:
-            score = f"{result.support_score:.1f}" if result.support_score else "0.0"
-            attempts_count = str(result.attempts_count or 0)
-            status = result.final_status or ""
-            parser = result.final_parser or ""
-            reason = result.failure_reason or result.selection_reason or ""
-            tag = ""
-            if status.startswith("CONVERTED") or status.startswith("PARTIAL"):
-                tag = "converted"
-            elif result.decision == "OK":
-                tag = "ok"
-            elif result.decision == "FORSE":
-                tag = "maybe"
-            elif result.decision == "NO":
-                tag = "no"
+    def _pick_folder(self) -> str:
+        return filedialog.askdirectory(initialdir=config.INPUT_DIR)
+
+    def _load_single(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        path = self._pick_file()
+        if not path:
+            return
+        pdf_path = Path(path)
+        self._start_scan([(pdf_path, pdf_path.name)])
+
+    def _load_folder(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        path = self._pick_folder()
+        if not path:
+            return
+        folder = Path(path)
+        if not folder.exists():
+            messagebox.showerror("Errore", "Cartella input non trovata.")
+            return
+        pdfs = sorted(folder.rglob("*.pdf"))
+        if not pdfs:
+            messagebox.showerror("Errore", "Nessun PDF trovato nella cartella.")
+            return
+        targets = [(pdf_path, str(pdf_path.relative_to(folder))) for pdf_path in pdfs]
+        self._start_scan(targets)
+
+    def _start_scan(self, targets: List[Tuple[Path, str]]) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        if not targets:
+            messagebox.showerror("Errore", "Nessun PDF selezionato.")
+            return
+        self.stop_event.clear()
+        self._run_debug = RunDebugCollector.start(
+            input_root=str(config.INPUT_DIR), run_type="scan"
+        )
+        self.scan_results = []
+        self._row_items = []
+        self._clear_tree()
+        self._reset_progress(len(targets))
+        self.status_var.set(f"Caricati {len(targets)} file. Avvio analisi...")
+        self._log(f"Avvio analisi su {len(targets)} file.")
+
+        for idx, (path, display_name) in enumerate(targets):
+            result = TriageResult(source_file=display_name, source_path=str(path))
+            self.scan_results.append(result)
+            item_id = f"row-{idx}"
+            self._row_items.append(item_id)
             self.triage_tree.insert(
                 "",
                 "end",
-                iid=result.source_file,
-                values=(
-                    result.source_file,
-                    result.decision,
-                    result.suggested_profile,
-                    score,
-                    status,
-                    parser,
-                    attempts_count,
-                    reason,
-                ),
-                tags=(tag,) if tag else (),
+                iid=item_id,
+                values=(display_name, "in attesa", "", "caricato"),
+                tags=("pending",),
             )
-        self.summary_var.set(self._format_summary())
-
-    def _update_action_buttons(self) -> None:
-        if not self.scan_done:
-            self.convert_button.configure(state="disabled")
-            self.enrich_button.configure(state="disabled")
-            return
-        has_ok = any(result.decision == "OK" for result in self.triage_results)
-        has_unknown = any(
-            result.suggested_profile == "unknown"
-            or result.decision in {"FORSE", "NO"}
-            for result in self.triage_results
-        )
-        self.convert_button.configure(state="normal" if has_ok else "disabled")
-        self.enrich_button.configure(state="normal" if has_unknown else "disabled")
-
-    def _update_scan_label(self) -> None:
-        label = "Scansiona file" if self.input_mode.get() == "file" else "Scansiona cartella"
-        self.scan_button.configure(text=label)
-
-    def _run_profile_enrich(self) -> None:
-        if not self.scan_done:
-            messagebox.showerror("Missing scan", "Run 'Scansiona cartella' first.")
-            return
-        candidates = [
-            result
-            for result in self.triage_results
-            if result.suggested_profile == "unknown"
-            or result.decision in {"FORSE", "NO"}
-        ]
-        if not candidates:
-            messagebox.showinfo("No candidates", "No PDFs need profile enrichment.")
-            return
 
         self._set_busy(True)
-        self.progress["value"] = 0
-        self.status_var.set("Arricchimento profili...")
-        self._log("Generating profile suggestions...")
-        self.stop_event.clear()
-
-        args = {"targets": candidates, "ocr": self.ocr_var.get()}
         self._worker = threading.Thread(
-            target=self._run_profile_enrich_background, args=(args,), daemon=True
+            target=self._run_scan_files_background, args=(targets,), daemon=True
         )
         self._worker.start()
 
-    def _run_profile_enrich_background(self, args: dict) -> None:
-        try:
-            results = []
-            total = len(args["targets"])
-            for idx, result in enumerate(args["targets"], start=1):
-                if self.stop_event.is_set():
-                    break
-                self._triage_progress_callback(idx - 1, total, result.source_file)
-                profile, stats = profile_enrich.suggest_profile_for_pdf(
-                    result.source_path, ocr=args["ocr"]
+    def _run_scan_files_background(self, targets: List[Tuple[Path, str]]) -> None:
+        results: List[TriageResult] = []
+        total = len(targets)
+        for idx, (pdf_path, display_name) in enumerate(targets, start=1):
+            if self.stop_event.is_set():
+                break
+            self._queue.put(("progress", idx - 1, total, display_name, "scan"))
+            cached_pages = []
+            try:
+                triage_result, cached_pages = triage.scan_pdf_cached(
+                    str(pdf_path), ocr=False
                 )
-                if profile.get("fields"):
-                    profile_id = profile_enrich.build_profile_id(result.source_file)
-                    output_path = profile_enrich.write_profile(profile_id, profile)
-                    results.append((result.source_file, output_path, stats))
-                self._triage_progress_callback(idx, total, result.source_file)
-        except Exception as exc:
-            self._queue.put(("error", str(exc)))
-            return
+                triage_result.source_file = display_name
+                triage_result.source_path = str(pdf_path)
+            except Exception as exc:
+                triage_result = TriageResult(
+                    source_file=display_name,
+                    source_path=str(pdf_path),
+                    decision="NO",
+                    suggested_profile="error",
+                    reasons=f"triage_error:{exc}",
+                )
+            results.append(triage_result)
+            self._queue.put(("scan_result", idx - 1, triage_result))
+            self._queue.put(("progress", idx, total, display_name, "scan"))
+            if self._run_debug:
+                self._run_debug.add_pdf(
+                    str(pdf_path),
+                    triage_result,
+                    cached_pages,
+                    reason=triage_result.reasons,
+                )
+        self._queue.put(("scan_done", results, self.stop_event.is_set()))
 
-        self._queue.put(("enrich_done", results, self.stop_event.is_set()))
+    def _convert_loaded(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        targets = [
+            (idx, result)
+            for idx, result in enumerate(self.scan_results)
+            if result.decision in {"OK", "FORSE"}
+        ]
+        if not targets:
+            self.status_var.set("Nessun file convertibile.")
+            return
+        self.stop_event.clear()
+        self._run_debug = RunDebugCollector.start(
+            input_root=str(config.INPUT_DIR), run_type="convert"
+        )
+        self._reset_progress(len(targets))
+        self.status_var.set(f"Conversione {len(targets)} file...")
+        self._log(f"Conversione {len(targets)} file.")
+        self._set_busy(True)
+        self._worker = threading.Thread(
+            target=self._run_convert_background, args=(targets,), daemon=True
+        )
+        self._worker.start()
+
+    def _run_convert_background(self, targets: List[Tuple[int, TriageResult]]) -> None:
+        total = len(targets)
+        converted = 0
+        for idx, (row_index, result) in enumerate(targets, start=1):
+            if self.stop_event.is_set():
+                break
+            self._queue.put(("progress", idx - 1, total, result.source_file, "convert"))
+            converted_result = auto_convert.run_auto_for_pdf(
+                pdf_path=result.source_path,
+                output_dir=str(Path(config.OUTPUT_DIR)),
+                ocr=False,
+                run_debug=self._run_debug,
+            )
+            converted_result.source_file = result.source_file
+            converted_result.source_path = result.source_path
+            self._queue.put(("convert_result", row_index, converted_result))
+            if converted_result.output_path:
+                self._queue.put(
+                    ("log", f"Output: {converted_result.output_path}")
+                )
+            else:
+                self._queue.put(
+                    ("log", f"Nessun output salvato per {converted_result.source_file}")
+                )
+            converted += 1
+            self._queue.put(("progress", idx, total, result.source_file, "convert"))
+        self._queue.put(("convert_done", converted, self.stop_event.is_set()))
+
+    def _clear_tree(self) -> None:
+        for item in self.triage_tree.get_children():
+            self.triage_tree.delete(item)
+
+    def _update_tree_row(self, row_index: int, result: TriageResult) -> None:
+        if row_index >= len(self._row_items):
+            return
+        decision = result.decision or "in attesa"
+        parser = (
+            result.winner_parser
+            or result.final_parser
+            or result.parser
+            or result.suggested_profile
+            or ""
+        )
+        note = result.reasons or result.failure_reason or result.selection_reason or ""
+        if result.final_status:
+            note = f"{result.final_status} | {note}" if note else result.final_status
+        if not result.decision and not note:
+            note = "caricato"
+        tag = "pending"
+        if result.decision == "OK":
+            tag = "ok"
+        elif result.decision == "FORSE":
+            tag = "maybe"
+        elif result.decision == "NO":
+            tag = "no"
+        item_id = self._row_items[row_index]
+        self.triage_tree.item(
+            item_id, values=(result.source_file, decision, parser, note), tags=(tag,)
+        )
+
+    def _set_progress_target(self, value: int, total: int) -> None:
+        self.progress["maximum"] = max(1, total)
+        self._progress_target = min(value, total)
+        if not self._progress_animating:
+            self._progress_animating = True
+            self._animate_progress()
+
+    def _animate_progress(self) -> None:
+        if self._progress_value < self._progress_target:
+            self._progress_value += 1
+            self.progress["value"] = self._progress_value
+            self.root.after(30, self._animate_progress)
+            return
+        self._progress_value = self._progress_target
+        self.progress["value"] = self._progress_value
+        self._progress_animating = False
+
+    def _reset_progress(self, total: int) -> None:
+        self.progress["maximum"] = max(1, total)
+        self._progress_target = 0
+        self._progress_value = 0
+        self.progress["value"] = 0
+        self._progress_animating = False
+
+    def _write_summary(self) -> None:
+        if not self._run_debug:
+            return
+        debug_dir = Path(config.DEBUG_PACK_DIR)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        self._run_debug.write(str(debug_dir))
+        self._run_debug = None
+        self._log(f"Report: {output_path}")
 
     def _poll_queue(self) -> None:
         while True:
@@ -692,79 +427,61 @@ class App:
                 break
             kind = item[0]
             if kind == "progress":
-                _, processed, total, page_number, pdf_total = item
-                if total:
-                    self.progress["maximum"] = total
-                    self.progress["value"] = processed
-                self.status_var.set(f"Processing page {page_number} of {pdf_total}")
-            elif kind == "triage_progress":
-                _, processed, total, filename = item
-                if total:
-                    self.progress["maximum"] = total
-                    self.progress["value"] = processed
-                self.status_var.set(f"Processing {filename} ({processed}/{total})")
-            elif kind == "triage_done":
-                results, report_path, was_stopped = item[1], item[2], item[3]
-                self.triage_results = results
-                self._render_triage_results()
-                self._log(f"Triage report: {report_path}")
-                self.status_var.set("Triage stopped" if was_stopped else "Triage completed")
-                self.scan_done = True
-                self._set_busy(False)
-            elif kind == "triage_convert_progress":
-                _, processed, total, filename = item
-                if total:
-                    self.progress["maximum"] = total
-                    self.progress["value"] = processed
-                self.status_var.set(f"Converting {filename} ({processed}/{total})")
-            elif kind == "triage_convert_done":
-                results = item[1]
-                report_path = item[2]
-                summary = item[3]
-                was_stopped = item[4]
-                self.triage_results = results
-                self._render_triage_results()
-                self._log(f"Triage report: {report_path}")
-                self._log(
-                    "Conversion summary: "
-                    f"ok={summary.get('processed_ok', 0)} "
-                    f"failed={summary.get('failed', 0)} "
-                    f"skipped={summary.get('skipped', 0)}"
-                )
-                self.status_var.set("Stopped" if was_stopped else "Completed")
-                self._set_busy(False)
-            elif kind == "enrich_done":
-                results = item[1]
-                was_stopped = item[2]
-                if results:
-                    for source_file, output_path, stats in results:
-                        self._log(
-                            f"Profile suggestion for {source_file}: {output_path} "
-                            f"(pages={stats.get('pages_used')}, fields={stats.get('fields_suggested')})"
-                        )
+                _, processed, total, filename, stage = item
+                self._set_progress_target(processed, total)
+                if stage == "convert":
+                    self.status_var.set(f"Conversione {filename} ({processed}/{total})")
                 else:
-                    self._log("No profile suggestions created.")
-                self.status_var.set("Stopped" if was_stopped else "Profile enrichment done")
+                    self.status_var.set(f"Analisi {filename} ({processed}/{total})")
+            elif kind == "scan_result":
+                row_index, result = item[1], item[2]
+                if 0 <= row_index < len(self.scan_results):
+                    self.scan_results[row_index] = result
+                    self._update_tree_row(row_index, result)
+            elif kind == "scan_done":
+                results, partial = item[1], item[2]
+                if len(results) == len(self.scan_results):
+                    self.scan_results = results
+                self._write_summary()
+                self.status_var.set("Analisi interrotta." if partial else "Analisi completata.")
                 self._set_busy(False)
-            elif kind == "log":
-                self._log(item[1])
-            elif kind == "done":
-                report = item[1]
-                debug_json = item[2]
-                self._log(f"Done. Rows: {len(report.rows)}")
-                self._log(
-                    f"Pages OCR used: {report.pages_ocr_used} | Needs review: {report.rows_needs_review}"
+            elif kind == "convert_result":
+                row_index, result = item[1], item[2]
+                if 0 <= row_index < len(self.scan_results):
+                    self.scan_results[row_index] = result
+                    self._update_tree_row(row_index, result)
+            elif kind == "convert_done":
+                total, partial = item[1], item[2]
+                self._write_summary()
+                msg = (
+                    f"Conversione interrotta ({total} completati)"
+                    if partial
+                    else f"Conversione completata ({total} completati)"
                 )
-                if debug_json:
-                    self._log(f"Debug JSON: {debug_json}")
-                self.status_var.set("Completed")
+                self.status_var.set(msg)
+                zero_rows = [
+                    result.source_file
+                    for result in self.scan_results
+                    if result.decision in {"OK", "FORSE"}
+                    and (result.rows_exported or 0) == 0
+                    and not result.output_path
+                ]
+                if zero_rows:
+                    names = ", ".join(zero_rows[:5])
+                    suffix = "..." if len(zero_rows) > 5 else ""
+                    notice = (
+                        "Alcuni file contengono 0 righe e non sono stati salvati "
+                        f"come XLSX: {names}{suffix}"
+                    )
+                    self._log(notice)
+                    messagebox.showinfo("Nessun output", notice)
                 self._set_busy(False)
             elif kind == "error":
                 message = item[1]
-                self._log(f"Error: {message}")
-                self.status_var.set("Error")
+                self._log(f"Errore: {message}")
+                self.status_var.set("Errore")
                 self._set_busy(False)
-                messagebox.showerror("Error", message)
+                messagebox.showerror("Errore", message)
         self.root.after(100, self._poll_queue)
 
     def start(self) -> None:

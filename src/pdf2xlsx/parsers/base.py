@@ -3,6 +3,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import List
 
+from pdf2xlsx import config
 from pdf2xlsx.core import segment
 from pdf2xlsx.utils import text as text_utils
 
@@ -60,6 +61,14 @@ class BaseParser(ABC):
         if not value:
             return ""
         value = text_utils.canonicalize_art_no(value.strip())
+        if not text_utils.is_plausible_code(value, min_len=config.CODE_MIN_LEN):
+            raw = raw_value or value
+            logging.getLogger(__name__).warning(
+                "Discarding art_no value: '%s' (raw: '%s') failed plausibility checks",
+                value,
+                raw,
+            )
+            return ""
         if self.art_no_value_pattern.match(value):
             return value
         raw = raw_value or value

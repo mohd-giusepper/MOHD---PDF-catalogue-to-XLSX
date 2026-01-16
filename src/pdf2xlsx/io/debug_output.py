@@ -112,6 +112,16 @@ def build_debug_payload(
         "attempts": attempts,
         "output_metrics": output_metrics,
     }
+    if report:
+        payload["analysis"] = {
+            "rows_candidate": getattr(report, "rows_candidate", 0),
+            "rows_after_parsing": getattr(report, "rows_after_parsing", 0),
+            "rows_after_filters": getattr(report, "rows_after_filters", 0),
+            "discard_reasons": getattr(report, "discard_reasons", {}) or {},
+            "discard_samples": getattr(report, "discard_samples", {}) or {},
+            "duplicates_summary": getattr(report, "duplicates_summary", []) or [],
+            "cooccurrence_samples": getattr(report, "cooccurrence_samples", []) or [],
+        }
 
     if _needs_suggestions(triage_result):
         suggestions = suggestions_utils.build_suggestions(
@@ -206,6 +216,9 @@ def build_page_metrics(cached_pages: List[page_cache.CachedPage]) -> List[dict]:
                 "numeric_density": page.numeric_density,
                 "currency_tokens": page.currency_tokens,
                 "table_likelihood": page.table_likelihood,
+                "mixed_code_count": page.mixed_code_count,
+                "price_like_count": page.price_like_count,
+                "cooccurrence_count": page.cooccurrence_count,
             }
         )
     return metrics
@@ -230,6 +243,7 @@ def format_attempts(attempts: List[dict]) -> List[dict]:
 def collect_label_candidates(
     cached_pages: List[page_cache.CachedPage],
     max_items: int = 30,
+    min_count: int = 3,
 ) -> List[dict]:
     counter: Dict[str, int] = {}
     for page in cached_pages:
@@ -243,7 +257,15 @@ def collect_label_candidates(
                 continue
             counter[clean] = counter.get(clean, 0) + 1
 
-    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    items = []
+    for line, count in counter.items():
+        if count < min_count:
+            continue
+        if len(line.split()) > 6:
+            continue
+        items.append((line, count))
+
+    items.sort(key=lambda item: (-item[1], item[0]))
     return [{"line": line, "count": count} for line, count in items[:max_items]]
 
 
@@ -252,4 +274,9 @@ def _is_label_like(line: str) -> bool:
         return True
     if "  " in line or "\t" in line:
         return True
+    letters = [char for char in line if char.isalpha()]
+    if letters:
+        upper_ratio = sum(1 for char in letters if char.isupper()) / len(letters)
+        if upper_ratio >= 0.6 and len(line) <= 40:
+            return True
     return False

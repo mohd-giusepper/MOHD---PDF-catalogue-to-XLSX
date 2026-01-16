@@ -14,7 +14,9 @@ LOGGER = logging.getLogger(__name__)
 
 CURRENCY_RE = re.compile(r"\b(?:EUR|DKK|SEK|NOK)\b", re.IGNORECASE)
 EURO_RE = re.compile(r"\u20ac")
-PRICE_RE = re.compile(r"\b\d{1,7}(?:[.,]\d{2})\b")
+PRICE_RE = re.compile(
+    r"\b\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?\b|\b\d{1,7}(?:[.,]\d{1,2})\b"
+)
 
 STRATEGY_PARSER_MAP = {
     "stelton_marker": "stelton_2025",

@@ -4,7 +4,7 @@ import os
 import re
 from pathlib import Path
 from collections import Counter, defaultdict
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from pdf2xlsx import config
 from pdf2xlsx.core import extract, normalize, scoring
@@ -21,6 +21,7 @@ ART_NO_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 LARGE_NUMBER_RE = re.compile(r"\b\d{6,}\b")
+DISCARD_SAMPLE_LIMIT = 5
 
 
 def run_pipeline(
@@ -47,6 +48,12 @@ def run_pipeline(
     debug_art_no_samples = 20
     target_currency = (currency_only or config.TARGET_CURRENCY).upper()
     skipped_missing_target_price = 0
+    rows_candidate = 0
+    rows_after_parsing = 0
+    rows_after_filters = 0
+    discard_reasons: Counter = Counter()
+    discard_samples: Dict[str, List[str]] = defaultdict(list)
+    cooccurrence_samples: List[str] = []
 
     cleanup_output_dir(output_xlsx, debug_json)
 
@@ -115,6 +122,22 @@ def run_pipeline(
                 section=block["section"],
                 source_file=source_file,
             )
+            rows_candidate += 1
+            rows_after_parsing += 1
+            normalized_block = normalize.normalize_text(sub_block)
+            flat_line = " ".join(normalized_block.split())
+            line_info = text_utils.analyze_line(flat_line)
+            discard_reason = primary_discard_reason(
+                parser=parser,
+                row=row,
+                raw_text=flat_line,
+                line_info=line_info,
+            )
+            if discard_reason:
+                discard_reasons[discard_reason] += 1
+                if len(discard_samples[discard_reason]) < DISCARD_SAMPLE_LIMIT:
+                    discard_samples[discard_reason].append(flat_line[:200])
+                continue
             confidence, needs_review, notes = scoring.score_row(
                 row=row,
                 size_unparsed=size_unparsed,
@@ -122,7 +145,6 @@ def run_pipeline(
                 currency=target_currency,
             )
 
-            normalized_block = normalize.normalize_text(sub_block)
             raw_block_id = hashlib.sha1(
                 f"{block['page']}:{normalized_block}".encode("utf-8")
             ).hexdigest()
@@ -147,7 +169,7 @@ def run_pipeline(
                         first_large_number_token = large_match.group(0)
                     break
 
-            snippet_source = art_line or " ".join(normalized_block.split())
+            snippet_source = art_line or flat_line
             raw_snippet = snippet_source[:200]
             row.raw_block_id = raw_block_id
             row.raw_snippet = raw_snippet
@@ -192,6 +214,9 @@ def run_pipeline(
                     source_line,
                 )
                 debug_art_no_samples -= 1
+            if row.art_no and line_info.get("price_like"):
+                if len(cooccurrence_samples) < DISCARD_SAMPLE_LIMIT:
+                    cooccurrence_samples.append(raw_snippet)
 
             invalid_price_note = f"invalid_price_{target_currency.lower()}"
             force_review = merged_note in {"merged_block_unsplit", "possible_merged_block"}
@@ -199,11 +224,20 @@ def run_pipeline(
                 force_review = True
 
             art_no_count = len(parser.art_no_regex.findall(sub_block))
+            if parser.name in {"table_based", "code_price_based"}:
+                art_no_count = 1 if row.art_no else 0
             has_any_price = bool(parser.price_pattern.search(sub_block))
+            price_regex = getattr(parser, "price_regex", None)
+            if price_regex and price_regex.search(sub_block):
+                has_any_price = True
+            if line_info.get("price_like"):
+                has_any_price = True
+            if row_has_price(row):
+                has_any_price = True
             invalid_reasons = []
-            if art_no_count == 0 or not row.art_no:
+            if not row.art_no:
                 invalid_reasons.append("invalid_chunk_missing_art_no")
-            elif art_no_count > 1:
+            elif art_no_count > 1 and parser.name not in {"table_based", "code_price_based"}:
                 invalid_reasons.append("invalid_chunk_multiple_art_no")
             if not has_any_price:
                 invalid_reasons.append("invalid_chunk_missing_price")
@@ -236,6 +270,7 @@ def run_pipeline(
                     continue
 
             rows.append(row)
+            rows_after_filters += 1
 
             if debug_json:
                 debug_items.append(
@@ -250,7 +285,8 @@ def run_pipeline(
                     }
                 )
 
-    apply_duplicate_policy(rows, target_currency)
+    dedup_info: Dict[str, object] = {}
+    apply_duplicate_policy(rows, target_currency, dedup_info)
     ensure_review_for_missing_prices(rows, target_currency)
 
     if debug_json:
@@ -297,7 +333,19 @@ def run_pipeline(
         )
     LOGGER.info("Output saved to %s", output_xlsx)
 
-    return build_report(rows, page_stats, target_currency, skipped_missing_target_price)
+    return build_report(
+        rows,
+        page_stats,
+        target_currency,
+        skipped_missing_target_price,
+        rows_candidate,
+        rows_after_parsing,
+        rows_after_filters,
+        discard_reasons,
+        discard_samples,
+        dedup_info,
+        cooccurrence_samples,
+    )
 
 
 def build_report(
@@ -305,6 +353,13 @@ def build_report(
     page_stats: List[dict],
     target_currency: str,
     skipped_missing_target_price: int,
+    rows_candidate: int,
+    rows_after_parsing: int,
+    rows_after_filters: int,
+    discard_reasons: Counter,
+    discard_samples: Dict[str, List[str]],
+    dedup_info: Dict[str, object],
+    cooccurrence_samples: List[str],
 ) -> RunReport:
     target_currency = (target_currency or config.TARGET_CURRENCY).upper()
     exported_rows = [row for row in rows if row.exported]
@@ -341,6 +396,13 @@ def build_report(
         examples_ok=[row for row in rows if not row.needs_review][:3],
         examples_needs_review=[row for row in rows if row.needs_review][:3],
         page_stats=page_stats,
+        rows_candidate=rows_candidate,
+        rows_after_parsing=rows_after_parsing,
+        rows_after_filters=rows_after_filters,
+        discard_reasons=dict(discard_reasons),
+        discard_samples=discard_samples,
+        duplicates_summary=dedup_info.get("duplicates_summary", []),
+        cooccurrence_samples=cooccurrence_samples,
         config_info={
             "threshold_text_len_for_ocr": config.THRESHOLD_TEXT_LEN_FOR_OCR,
             "confidence_threshold": config.CONFIDENCE_THRESHOLD,
@@ -491,6 +553,28 @@ def unique_notes(notes: List[str]) -> List[str]:
     return unique
 
 
+def row_has_price(row: ProductRow) -> bool:
+    return any(
+        price is not None
+        for price in (row.price_eur, row.price_dkk, row.price_sek, row.price_nok)
+    )
+
+
+def primary_discard_reason(parser, row: ProductRow, raw_text: str, line_info: Dict[str, object]) -> str:
+    if not row.art_no:
+        return "bad_id"
+    header_like_fn = getattr(parser, "_is_header_like", None)
+    if header_like_fn and header_like_fn(raw_text):
+        return "header_like"
+    if line_info.get("dimension_line") and not line_info.get("price_like"):
+        return "dimension_line"
+    if parser.name == "code_price_based" and not line_info.get("price_like"):
+        return "no_price"
+    if not line_info.get("price_like") and not row_has_price(row):
+        return "no_price"
+    return ""
+
+
 def canonical_art_no_key(value: str, raw_text: str = "") -> str:
     key = text_utils.canonicalize_art_no(value or "")
     if not key:
@@ -540,7 +624,9 @@ def ensure_review_for_missing_prices(rows: List[ProductRow], currency: str) -> N
             row.needs_review = True
 
 
-def apply_duplicate_policy(rows: List[ProductRow], currency: str) -> None:
+def apply_duplicate_policy(
+    rows: List[ProductRow], currency: str, dedup_info: Optional[Dict[str, object]] = None
+) -> None:
     currency = currency.upper()
     grouped = defaultdict(list)
     for row in rows:
@@ -549,49 +635,80 @@ def apply_duplicate_policy(rows: List[ProductRow], currency: str) -> None:
             row.art_no = key
             grouped[key].append(row)
 
-    conflicts = set()
+    summary_items = []
     for art_no, group_rows in grouped.items():
         if len(group_rows) < 2:
             continue
-        values = set(
-            (
-                row.product_name_en.strip().lower(),
-                get_price_by_currency(row, currency),
-            )
-            for row in group_rows
-        )
-        if len(values) > 1:
-            conflicts.add(art_no)
 
-    for art_no, group_rows in grouped.items():
-        if len(group_rows) < 2:
-            continue
-        if art_no in conflicts:
-            for row in group_rows:
-                row.exported = False
-                row.needs_review = True
-                add_row_note(row, "duplicate_conflict")
-            continue
-
-        best_row = select_best_row(group_rows, currency)
+        scored = []
         for row in group_rows:
-            if row is best_row:
-                continue
+            line_text = row.raw_snippet or row.product_name_raw or ""
+            line_info = text_utils.analyze_line(line_text)
+            score = row_score(row, currency, line_info=line_info)
+            price_like = bool(line_info.get("price_like")) or row_has_price(row)
+            scored.append(
+                {
+                    "row": row,
+                    "score": score,
+                    "line_info": line_info,
+                    "price_like": price_like,
+                    "line_text": line_text,
+                }
+            )
+
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        best_row = scored[0]["row"]
+        variant_reasons = Counter()
+        variant_samples = []
+
+        for item in scored[1:]:
+            row = item["row"]
+            line_info = item["line_info"]
+            price_like = item["price_like"]
+            if line_info.get("dimension_line") and not price_like:
+                reason = "technical_sheet_line"
+                row.needs_review = False
+            elif not price_like:
+                reason = "technical_sheet_line"
+                row.needs_review = False
+            else:
+                reason = "duplicate_variant"
             row.exported = False
-            row.needs_review = True
-            add_row_note(row, "duplicate_art_no")
+            add_row_note(row, reason)
+            variant_reasons[reason] += 1
+            if len(variant_samples) < 3:
+                variant_samples.append((item["line_text"] or "")[:160])
+
+        summary_items.append(
+            {
+                "art_no": art_no,
+                "count": len(group_rows),
+                "best_score": scored[0]["score"],
+                "best_line": (scored[0]["line_text"] or "")[:160],
+                "variant_reasons": dict(variant_reasons),
+                "variant_samples": variant_samples,
+            }
+        )
+
+    summary_items.sort(key=lambda item: (-item["count"], item["art_no"]))
+    if dedup_info is not None:
+        dedup_info["duplicates_summary"] = summary_items[:20]
 
 
 def select_best_row(rows: List[ProductRow], currency: str) -> ProductRow:
     return max(rows, key=lambda row: row_score(row, currency))
 
 
-def row_score(row: ProductRow, currency: str) -> int:
+def row_score(row: ProductRow, currency: str, line_info: Optional[Dict[str, object]] = None) -> int:
+    if line_info is None:
+        line_info = text_utils.analyze_line(row.raw_snippet or row.product_name_raw or "")
     score = 0
     if row.product_name_en:
         score += 3
-    if get_price_by_currency(row, currency) is not None:
-        score += 3
+    if get_price_by_currency(row, currency) is not None or line_info.get("price_like"):
+        score += 4
+    if line_info.get("has_currency"):
+        score += 2
     if row.designer:
         score += 1
     if row.size_raw:
@@ -602,10 +719,14 @@ def row_score(row: ProductRow, currency: str) -> int:
         score += 1
     if row.section:
         score += 1
+    if line_info.get("dimension_line"):
+        score -= 3
+    if len((row.product_name_raw or "").split()) > 10 and not line_info.get("price_like"):
+        score -= 2
     if row.needs_review:
-        score -= 2
+        score -= 1
     if not row.exported:
-        score -= 2
+        score -= 1
     return score
 
 

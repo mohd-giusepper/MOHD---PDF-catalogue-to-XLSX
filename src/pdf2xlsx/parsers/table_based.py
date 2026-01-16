@@ -10,7 +10,9 @@ from pdf2xlsx.utils import text as text_utils
 class TableBasedParser(BaseParser):
     name = "table_based"
     column_split_regex = re.compile(r"\s{2,}|\t")
-    price_regex = re.compile(r"(?:€\s*)?([0-9]{1,7}(?:[.,][0-9]{2})?)")
+    price_regex = re.compile(
+        r"([0-9]{1,3}(?:[.,][0-9]{3})+(?:[.,][0-9]{2})?|[0-9]{1,7}(?:[.,][0-9]{1,2})?)"
+    )
 
     def __init__(self) -> None:
         profile_dict = label_utils.load_profile_dictionary("table_based")
@@ -93,8 +95,11 @@ class TableBasedParser(BaseParser):
                 mapping["code"] = idx
             if label_utils.count_label_hits(self.label_patterns, "description", column):
                 mapping["description"] = idx
-            if label_utils.count_label_hits(self.label_patterns, "price", column):
-                mapping["price"] = idx
+            if (
+                label_utils.count_label_hits(self.label_patterns, "price", column)
+                or label_utils.count_label_hits(self.label_patterns, "currency", column)
+            ):
+                mapping.setdefault("price", idx)
         if len(mapping) >= 2:
             return mapping
         return {}
@@ -106,6 +111,7 @@ class TableBasedParser(BaseParser):
             label_utils.count_label_hits(self.label_patterns, "code", line)
             + label_utils.count_label_hits(self.label_patterns, "description", line)
             + label_utils.count_label_hits(self.label_patterns, "price", line)
+            + label_utils.count_label_hits(self.label_patterns, "currency", line)
         )
         return label_hits >= 2
 

@@ -6,7 +6,7 @@ from typing import Callable, List, Optional, Tuple
 
 from pdf2xlsx import config
 from pdf2xlsx.core import normalize, page_cache, pipeline, scoring, triage
-from pdf2xlsx.io import debug_output
+from pdf2xlsx.io.run_debug import RunDebugCollector
 from pdf2xlsx.models import TriageResult
 from pdf2xlsx.parsers import get_parser
 from pdf2xlsx.utils import labels as label_utils
@@ -56,6 +56,7 @@ def run_auto_folder(
     full_pages: Optional[List[int]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    run_debug: Optional[RunDebugCollector] = None,
 ) -> List[TriageResult]:
     folder = Path(input_dir)
     pdfs = sorted(folder.glob("*.pdf"))
@@ -76,6 +77,7 @@ def run_auto_folder(
             currency_only=currency_only,
             fast_eval_only=fast_eval_only,
             full_pages=full_pages,
+            run_debug=run_debug,
         )
         results.append(result)
         if progress_callback:
@@ -107,9 +109,10 @@ def run_auto_for_pdf(
     triage_result: Optional[TriageResult] = None,
     debug_enabled: bool = False,
     debug_output_dir: Optional[str] = None,
+    run_debug: Optional[RunDebugCollector] = None,
+    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
 ) -> TriageResult:
     eval_start = time.monotonic()
-    debug_dir = debug_output_dir or output_dir
     label_dict = label_utils.load_label_dictionary()
     marker_dict = label_utils.load_profile_dictionary("stelton_marker")
     code_dict = label_utils.load_profile_dictionary("code_price_based")
@@ -236,14 +239,13 @@ def run_auto_for_pdf(
             triage_result.failure_reason = extract_last_failure(attempts[-1])
         else:
             triage_result.failure_reason = "no_parsers_available"
-        debug_output.write_debug_json(
-            pdf_path,
-            triage_result,
-            cached_pages,
-            debug_dir,
-            reason=triage_result.failure_reason,
-            force=True,
-        )
+        if run_debug:
+            run_debug.add_pdf(
+                pdf_path,
+                triage_result,
+                cached_pages,
+                reason=triage_result.failure_reason,
+            )
         return triage_result
 
     parser_name = selected.get("parser", "")
@@ -270,12 +272,11 @@ def run_auto_for_pdf(
         triage_result.selection_reason = (
             f"fast_eval_score={selected.get('score', 0.0):.3f}"
         )
-        if debug_enabled:
-            debug_output.write_debug_json(
+        if run_debug:
+            run_debug.add_pdf(
                 pdf_path,
                 triage_result,
                 cached_pages,
-                debug_dir,
                 reason=triage_result.selection_reason,
             )
         return triage_result
@@ -291,6 +292,7 @@ def run_auto_for_pdf(
         currency_only=target_currency,
         filter_currency=filter_currency,
         allow_empty_output=False,
+        progress_callback=progress_callback,
     )
     ok, reason, metrics = evaluate_report(report, target_currency)
     apply_report_metrics(triage_result, report)
@@ -315,12 +317,11 @@ def run_auto_for_pdf(
                 LOGGER.warning("Could not rename %s to %s", attempt_xlsx, final_xlsx)
             triage_result.final_status = f"PARTIAL(parser={parser_name})"
             triage_result.output_path = str(final_xlsx)
-            if debug_enabled:
-                debug_output.write_debug_json(
+            if run_debug:
+                run_debug.add_pdf(
                     pdf_path,
                     triage_result,
                     cached_pages,
-                    debug_dir,
                     report=report,
                     reason=reason,
                 )
@@ -331,26 +332,24 @@ def run_auto_for_pdf(
                 attempt_xlsx.unlink()
             except OSError:
                 LOGGER.warning("Could not remove failed output %s", attempt_xlsx)
-        debug_output.write_debug_json(
-            pdf_path,
-            triage_result,
-            cached_pages,
-            debug_dir,
-            report=report,
-            reason=reason,
-            force=True,
-        )
+        if run_debug:
+            run_debug.add_pdf(
+                pdf_path,
+                triage_result,
+                cached_pages,
+                report=report,
+                reason=reason,
+            )
         return triage_result
 
     selected["metrics"] = metrics
     selected["score"] = score_run(metrics)
     result = finalize_selection(triage_result, selected, attempts, output_dir_path, stem)
-    if debug_enabled:
-        debug_output.write_debug_json(
+    if run_debug:
+        run_debug.add_pdf(
             pdf_path,
             triage_result,
             cached_pages,
-            debug_dir,
             report=report,
             reason=triage_result.selection_reason,
         )
@@ -394,9 +393,6 @@ def evaluate_metrics(metrics: dict) -> Tuple[bool, str, dict]:
         return False, "no_valid_rows_found", metrics
     if rows_exported < config.AUTO_ROWS_MIN:
         return False, "too_few_rows", metrics
-
-    if metrics.get("duplicate_conflicts_count", 0) > 0:
-        return False, "duplicate_conflicts", metrics
 
     if metrics.get("unique_code_ratio", 0.0) < config.AUTO_UNIQUE_CODE_RATIO_MIN:
         return False, "low_unique_code_ratio", metrics
@@ -641,6 +637,17 @@ def evaluate_parser_fast(
                     section=block["section"],
                     source_file=source_file,
                 )
+                normalized_block = normalize.normalize_text(sub_block)
+                flat_line = " ".join(normalized_block.split())
+                line_info = text_utils.analyze_line(flat_line)
+                discard_reason = pipeline.primary_discard_reason(
+                    parser=parser,
+                    row=row,
+                    raw_text=flat_line,
+                    line_info=line_info,
+                )
+                if discard_reason:
+                    continue
                 confidence, needs_review, notes = scoring.score_row(
                     row=row,
                     size_unparsed=size_unparsed,
@@ -657,6 +664,7 @@ def evaluate_parser_fast(
 
                 if row.art_no:
                     row.art_no = text_utils.canonicalize_art_no(row.art_no)
+                row.raw_snippet = flat_line[:200]
 
                 invalid_price_note = f"invalid_price_{target_currency.lower()}"
                 force_review = merged_note in {
@@ -667,11 +675,20 @@ def evaluate_parser_fast(
                     force_review = True
 
                 art_no_count = len(parser.art_no_regex.findall(sub_block))
+                if parser.name in {"table_based", "code_price_based"}:
+                    art_no_count = 1 if row.art_no else 0
                 has_any_price = bool(parser.price_pattern.search(sub_block))
+                price_regex = getattr(parser, "price_regex", None)
+                if price_regex and price_regex.search(sub_block):
+                    has_any_price = True
+                if line_info.get("price_like"):
+                    has_any_price = True
+                if pipeline.row_has_price(row):
+                    has_any_price = True
                 invalid_reasons = []
-                if art_no_count == 0 or not row.art_no:
+                if not row.art_no:
                     invalid_reasons.append("invalid_chunk_missing_art_no")
-                elif art_no_count > 1:
+                elif art_no_count > 1 and parser.name not in {"table_based", "code_price_based"}:
                     invalid_reasons.append("invalid_chunk_multiple_art_no")
                 if not has_any_price:
                     invalid_reasons.append("invalid_chunk_missing_price")
@@ -717,7 +734,7 @@ def evaluate_parser_fast(
                 "score": metrics["eval_score"],
             }
 
-    pipeline.apply_duplicate_policy(rows, target_currency)
+    pipeline.apply_duplicate_policy(rows, target_currency, {})
     pipeline.ensure_review_for_missing_prices(rows, target_currency)
     metrics = build_metrics_from_rows(rows, target_currency)
     metrics.update(

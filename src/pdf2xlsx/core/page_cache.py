@@ -7,13 +7,14 @@ import pdfplumber
 
 from pdf2xlsx import config
 from pdf2xlsx.core import extract, normalize
+from pdf2xlsx.utils import text as text_utils
 
 
 _NUMBER_RE = re.compile(r"\d")
 _MULTI_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
 _CURRENCY_TOKEN_RE = re.compile(r"\b[A-Z]{3}\b")
 _KNOWN_CURRENCIES = {"EUR", "DKK", "SEK", "NOK", "USD", "GBP", "CHF", "JPY", "CAD", "AUD"}
-_PRICE_RE = re.compile(r"\b\d{1,7}(?:[.,]\d{2})\b")
+_CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-./]*")
 
 
 @dataclass
@@ -32,6 +33,9 @@ class CachedPage:
     currency_tokens: Dict[str, int] = field(default_factory=dict)
     table_likelihood: float = 0.0
     signal_score: float = 0.0
+    mixed_code_count: int = 0
+    price_like_count: int = 0
+    cooccurrence_count: int = 0
 
 
 def build_sample_cache(
@@ -151,8 +155,32 @@ def build_signal_cache(
             table_hint = _table_hint(lines)
             numeric_density = _numeric_density(normalized)
             currency_tokens = _collect_currency_tokens(text)
-            price_hits = len(_PRICE_RE.findall(normalized))
-            signal_score = price_hits * 2 + sum(currency_tokens.values()) + numeric_density * 50.0
+            mixed_code_count = 0
+            price_like_count = 0
+            cooccurrence_count = 0
+            for line in lines:
+                if not line:
+                    continue
+                line_info = text_utils.analyze_line(line)
+                price_like = bool(line_info.get("price_like"))
+                if price_like:
+                    price_like_count += 1
+                code_count = 0
+                for token in _CODE_TOKEN_RE.findall(line):
+                    if text_utils.is_plausible_code(token, min_len=config.CODE_MIN_LEN):
+                        code_count += 1
+                if code_count:
+                    mixed_code_count += code_count
+                if price_like and code_count:
+                    cooccurrence_count += 1
+
+            signal_score = (
+                cooccurrence_count * 4.0
+                + price_like_count * 2.0
+                + mixed_code_count * 1.0
+                + sum(currency_tokens.values()) * 1.5
+                + numeric_density * 40.0
+            )
             if table_hint:
                 signal_score += 5.0
             if has_stopword:
@@ -173,6 +201,9 @@ def build_signal_cache(
                 currency_tokens=currency_tokens,
                 table_likelihood=0.0,
                 signal_score=round(signal_score, 4),
+                mixed_code_count=mixed_code_count,
+                price_like_count=price_like_count,
+                cooccurrence_count=cooccurrence_count,
             )
             candidates.append((cached_page, has_stopword))
             if has_stopword:

@@ -3,11 +3,16 @@
   "fields": {
     "art_no": [
       "re:\\bart\\.?\\s*no\\.?\\b",
+      "art no",
+      "art. no",
       "article no",
       "article number",
       "articolo",
       "articolo n",
-      "articolo nr"
+      "articolo nr",
+      "articolo no",
+      "part no",
+      "part number"
     ],
     "rrp": [
       "rrp",
@@ -59,7 +64,8 @@
       "item description",
       "name",
       "denominazione",
-      "nome prodotto"
+      "nome prodotto",
+      "item name"
     ],
     "price": [
       "price",
@@ -75,15 +81,25 @@
       "recommended price",
       "retail price",
       "public price",
-      "eur",
-      "dkk",
-      "sek",
-      "nok",
       "prix",
       "preis",
       "precio",
       "pvp",
       "uvp"
+    ],
+    "currency": [
+      "currency",
+      "valuta",
+      "eur",
+      "dkk",
+      "sek",
+      "nok",
+      "usd",
+      "gbp",
+      "chf",
+      "jpy",
+      "cad",
+      "aud"
     ],
     "size": [
       "size",
@@ -95,6 +111,27 @@
       "misure",
       "misura",
       "measurements"
+    ],
+    "material": [
+      "material",
+      "materiale",
+      "materia",
+      "finish",
+      "finitura"
+    ],
+    "color": [
+      "color",
+      "colour",
+      "colore",
+      "farbe",
+      "couleur"
+    ],
+    "notes": [
+      "notes",
+      "note",
+      "remarks",
+      "osservazioni",
+      "note tecniche"
     ]
   },
   "stopwords": [

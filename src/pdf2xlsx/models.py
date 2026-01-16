@@ -58,6 +58,13 @@ class RunReport:
     examples_ok: List[ProductRow] = field(default_factory=list)
     examples_needs_review: List[ProductRow] = field(default_factory=list)
     page_stats: List[dict] = field(default_factory=list)
+    rows_candidate: int = 0
+    rows_after_parsing: int = 0
+    rows_after_filters: int = 0
+    discard_reasons: dict = field(default_factory=dict)
+    discard_samples: dict = field(default_factory=dict)
+    duplicates_summary: List[dict] = field(default_factory=list)
+    cooccurrence_samples: List[str] = field(default_factory=list)
     config_info: dict = field(default_factory=dict)
 
 
