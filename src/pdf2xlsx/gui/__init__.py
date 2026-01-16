@@ -1,5 +1,5 @@
 """GUI package."""
 
-from pdf2xlsx.gui.app_tk import start
+from pdf2xlsx.gui.app_pygame import start
 
 __all__ = ["start"]

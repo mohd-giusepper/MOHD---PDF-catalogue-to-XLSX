@@ -1,0 +1,108 @@
+{
+  "version": "1.0",
+  "fields": {
+    "art_no": [
+      "re:\\bart\\.?\\s*no\\.?\\b",
+      "article no",
+      "article number",
+      "articolo",
+      "articolo n",
+      "articolo nr"
+    ],
+    "rrp": [
+      "rrp",
+      "list price",
+      "prezzo listino",
+      "msrp",
+      "srp",
+      "recommended retail price"
+    ],
+    "colli": [
+      "colli",
+      "collo",
+      "packing",
+      "pack",
+      "package",
+      "packaging",
+      "ctn",
+      "qty/ctn",
+      "pcs/ctn"
+    ],
+    "designer": [
+      "designer",
+      "designed by",
+      "design"
+    ],
+    "code": [
+      "code",
+      "cod",
+      "cod.",
+      "codice",
+      "codice prodotto",
+      "codice articolo",
+      "item no",
+      "item nr",
+      "item #",
+      "reference",
+      "ref",
+      "ref.",
+      "sku",
+      "model"
+    ],
+    "description": [
+      "description",
+      "descrizione",
+      "descrizione prodotto",
+      "descrizione articolo",
+      "product name",
+      "product description",
+      "item description",
+      "name",
+      "denominazione",
+      "nome prodotto"
+    ],
+    "price": [
+      "price",
+      "unit price",
+      "net price",
+      "gross price",
+      "prezzo",
+      "prezzo netto",
+      "prezzo lordo",
+      "prezzo unitario",
+      "list price",
+      "price list",
+      "recommended price",
+      "retail price",
+      "public price",
+      "eur",
+      "dkk",
+      "sek",
+      "nok",
+      "prix",
+      "preis",
+      "precio",
+      "pvp",
+      "uvp"
+    ],
+    "size": [
+      "size",
+      "dimensions",
+      "dimension",
+      "dim.",
+      "dimensioni",
+      "dimensiones",
+      "misure",
+      "misura",
+      "measurements"
+    ]
+  },
+  "stopwords": [
+    "terms",
+    "conditions",
+    "indice",
+    "index",
+    "contents",
+    "table of contents"
+  ]
+}

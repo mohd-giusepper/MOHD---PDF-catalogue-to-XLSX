@@ -1,0 +1,859 @@
+import logging
+import re
+import time
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+from pdf2xlsx import config
+from pdf2xlsx.core import normalize, page_cache, pipeline, scoring, triage
+from pdf2xlsx.io import debug_output
+from pdf2xlsx.models import TriageResult
+from pdf2xlsx.parsers import get_parser
+from pdf2xlsx.utils import labels as label_utils
+from pdf2xlsx.utils import text as text_utils
+
+
+LOGGER = logging.getLogger(__name__)
+
+PROFILE_ORDER = ["stelton_marker", "table_based", "code_price_based"]
+PROFILE_PARSER_MAP = {
+    "stelton_marker": "stelton_2025",
+    "table_based": "table_based",
+    "code_price_based": "code_price_based",
+}
+CURRENCY_CODES = ("EUR", "DKK", "SEK", "NOK")
+CURRENCY_PRICE_RE = re.compile(
+    r"\b(EUR|DKK|SEK|NOK)\s+([0-9]+(?:[.,][0-9]{1,2})?)",
+    re.IGNORECASE,
+)
+
+
+def detect_target_currency(cached_pages, fallback: str) -> Tuple[str, float, dict, bool]:
+    counts = {code: 0 for code in CURRENCY_CODES}
+    for page in cached_pages:
+        text = page.normalized_text or ""
+        for match in CURRENCY_PRICE_RE.finditer(text):
+            code = match.group(1).upper()
+            counts[code] += 1
+    total = sum(counts.values())
+    multi_currency = sum(1 for value in counts.values() if value > 0) >= 2
+    if total == 0:
+        return fallback, 0.0, counts, False
+    best = max(counts, key=counts.get)
+    ratio = counts[best] / total if total else 0.0
+    if total < config.CURRENCY_AUTO_MIN_COUNT or ratio < config.CURRENCY_AUTO_MIN_RATIO:
+        return fallback, ratio, counts, multi_currency
+    return best, ratio, counts, multi_currency
+
+
+def run_auto_folder(
+    input_dir: str,
+    output_dir: str,
+    ocr: bool = False,
+    currency: str = config.TARGET_CURRENCY,
+    currency_only: Optional[str] = None,
+    fast_eval_only: bool = False,
+    full_pages: Optional[List[int]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> List[TriageResult]:
+    folder = Path(input_dir)
+    pdfs = sorted(folder.glob("*.pdf"))
+    results: List[TriageResult] = []
+    total = len(pdfs)
+
+    for idx, pdf_path in enumerate(pdfs, start=1):
+        if should_stop and should_stop():
+            LOGGER.info("Auto-convert stopped by user.")
+            break
+        if progress_callback:
+            progress_callback(idx - 1, total, pdf_path.name)
+        result = run_auto_for_pdf(
+            pdf_path=str(pdf_path),
+            output_dir=output_dir,
+            ocr=ocr,
+            currency=currency,
+            currency_only=currency_only,
+            fast_eval_only=fast_eval_only,
+            full_pages=full_pages,
+        )
+        results.append(result)
+        if progress_callback:
+            progress_callback(idx, total, pdf_path.name)
+
+    if should_stop and should_stop() and len(results) < total:
+        for pdf_path in pdfs[len(results) :]:
+            results.append(
+                TriageResult(
+                    source_file=pdf_path.name,
+                    source_path=str(pdf_path),
+                    final_status="SKIPPED(stopped)",
+                    failure_reason="stopped",
+                )
+            )
+
+    return results
+
+
+def run_auto_for_pdf(
+    pdf_path: str,
+    output_dir: str,
+    ocr: bool = False,
+    currency: str = config.TARGET_CURRENCY,
+    currency_only: Optional[str] = None,
+    fast_eval_only: bool = False,
+    full_pages: Optional[List[int]] = None,
+    cached_pages: Optional[List[page_cache.CachedPage]] = None,
+    triage_result: Optional[TriageResult] = None,
+    debug_enabled: bool = False,
+    debug_output_dir: Optional[str] = None,
+) -> TriageResult:
+    eval_start = time.monotonic()
+    debug_dir = debug_output_dir or output_dir
+    label_dict = label_utils.load_label_dictionary()
+    marker_dict = label_utils.load_profile_dictionary("stelton_marker")
+    code_dict = label_utils.load_profile_dictionary("code_price_based")
+    marker_patterns = label_utils.build_label_patterns(marker_dict.get("fields", {}))
+    code_patterns = label_utils.build_label_patterns(code_dict.get("fields", {}))
+    stopwords = label_dict.get("stopwords") or config.TRIAGE_STOPWORDS
+
+    if cached_pages is None or triage_result is None:
+        cached_pages, page_notes = page_cache.build_signal_cache(
+            pdf_path,
+            max_pages=config.TRIAGE_SAMPLE_PAGES_MAX,
+            min_text_len=config.TRIAGE_TEXT_LEN_MIN,
+            stopwords=stopwords,
+            ocr=ocr,
+        )
+        triage_result = triage.scan_cached_pages(
+            pdf_path=pdf_path,
+            cached_pages=cached_pages,
+            page_notes=page_notes,
+            marker_patterns=marker_patterns,
+            code_patterns=code_patterns,
+        )
+    else:
+        page_notes = []
+
+    fallback_currency = (currency or config.TARGET_CURRENCY).upper()
+    explicit_currency = (currency_only or "").upper()
+    filter_currency = False
+    if explicit_currency in CURRENCY_CODES:
+        target_currency = explicit_currency
+        currency_confidence = 1.0
+        currency_counts = {}
+        filter_currency = True
+    else:
+        detected_currency, currency_confidence, currency_counts, multi_currency = (
+            detect_target_currency(cached_pages, fallback_currency)
+        )
+        if multi_currency and "EUR" in currency_counts and currency_counts["EUR"] > 0:
+            target_currency = "EUR"
+        else:
+            target_currency = detected_currency
+        filter_currency = multi_currency
+        LOGGER.info(
+            "Auto target currency: %s (confidence=%.2f counts=%s)",
+            target_currency,
+            currency_confidence,
+            currency_counts,
+        )
+    triage_result.target_currency = target_currency
+    triage_result.currency_confidence = currency_confidence
+    triage_result.currency_counts = currency_counts
+
+    attempts = []
+    attempts_detail: List[dict] = []
+    attempt_results: List[dict] = []
+    ordered_profiles = order_profiles(triage_result)
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    stem = Path(pdf_path).stem
+
+    for profile_id in ordered_profiles:
+        parser_name = PROFILE_PARSER_MAP.get(profile_id, "")
+        if not parser_name:
+            attempts.append(f"{profile_id}:fail(missing_parser)")
+            attempt_results.append(
+                {"parser": parser_name, "ok": False, "reason": "missing_parser"}
+            )
+            continue
+
+        eval_result = evaluate_parser_fast(
+            cached_pages=cached_pages,
+            parser_name=parser_name,
+            source_file=Path(pdf_path).name,
+            currency=target_currency,
+            currency_only=target_currency if filter_currency else "",
+            triage_result=triage_result,
+        )
+        attempt_results.append(eval_result)
+        attempts_detail.append(
+            {
+                "source_file": Path(pdf_path).name,
+                "parser": parser_name,
+                "eval_pages": eval_result.get("metrics", {}).get("eval_pages_used", 0),
+                "eval_rows": eval_result.get("metrics", {}).get("eval_rows", 0),
+                "eval_time_ms": eval_result.get("metrics", {}).get("eval_time_ms", 0),
+                "eval_score": eval_result.get("metrics", {}).get("eval_score", 0.0),
+                "status": "ok" if eval_result.get("ok") else "fail",
+                "fail_reason": "" if eval_result.get("ok") else eval_result.get("reason", ""),
+            }
+        )
+        attempts.append(
+            format_attempt(
+                parser_name,
+                "ok" if eval_result.get("ok") else "fail",
+                eval_result.get("reason", ""),
+                eval_result.get("metrics", {}),
+                eval_result.get("score"),
+            )
+        )
+
+        if eval_result.get("ok") and is_excellent(eval_result.get("metrics", {})):
+            break
+
+    triage_result.eval_time_ms_total = int((time.monotonic() - eval_start) * 1000)
+    triage_result.attempts_detail = attempts_detail
+    selected = select_best_run(attempt_results)
+    if not selected:
+        if triage_result.decision == "OK":
+            triage_result.decision = "FORSE"
+        triage_result.final_status = "FAILED(all_parsers)"
+        triage_result.attempts_count = len(attempts)
+        triage_result.attempts_summary = "; ".join(attempts)
+        triage_result.rows_exported = 0
+        triage_result.review_rows = 0
+        triage_result.review_rate = 0.0
+        triage_result.rows_skipped_missing_target_currency = 0
+        triage_result.duplicate_art_no_count = 0
+        triage_result.duplicate_conflicts_count = 0
+        triage_result.bad_art_no_count = 0
+        triage_result.corrected_art_no_count = 0
+        triage_result.suspicious_numeric_art_no_seen = False
+        triage_result.examples_bad_art_no = []
+        if attempts:
+            triage_result.failure_reason = extract_last_failure(attempts[-1])
+        else:
+            triage_result.failure_reason = "no_parsers_available"
+        debug_output.write_debug_json(
+            pdf_path,
+            triage_result,
+            cached_pages,
+            debug_dir,
+            reason=triage_result.failure_reason,
+            force=True,
+        )
+        return triage_result
+
+    parser_name = selected.get("parser", "")
+    triage_result.winner_parser = parser_name
+    if fast_eval_only:
+        metrics = selected.get("metrics", {}) or {}
+        triage_result.final_status = f"FAST_EVAL(parser={parser_name})"
+        triage_result.attempts_count = len(attempts)
+        triage_result.attempts_summary = "; ".join(attempts)
+        triage_result.rows_exported = int(metrics.get("rows_exported", 0) or 0)
+        triage_result.review_rate = float(metrics.get("review_rate", 0.0) or 0.0)
+        triage_result.review_rows = int(
+            round(triage_result.rows_exported * triage_result.review_rate)
+        )
+        triage_result.rows_skipped_missing_target_currency = 0
+        triage_result.duplicate_art_no_count = 0
+        triage_result.duplicate_conflicts_count = int(
+            metrics.get("duplicate_conflicts_count", 0) or 0
+        )
+        triage_result.bad_art_no_count = 0
+        triage_result.corrected_art_no_count = 0
+        triage_result.suspicious_numeric_art_no_seen = False
+        triage_result.examples_bad_art_no = []
+        triage_result.selection_reason = (
+            f"fast_eval_score={selected.get('score', 0.0):.3f}"
+        )
+        if debug_enabled:
+            debug_output.write_debug_json(
+                pdf_path,
+                triage_result,
+                cached_pages,
+                debug_dir,
+                reason=triage_result.selection_reason,
+            )
+        return triage_result
+
+    attempt_xlsx = output_dir_path / f"{stem}.{parser_name}.xlsx"
+    report = pipeline.run_pipeline(
+        input_pdf=pdf_path,
+        output_xlsx=str(attempt_xlsx),
+        pages=full_pages,
+        debug_json=None,
+        parser_name=parser_name,
+        ocr=ocr,
+        currency_only=target_currency,
+        filter_currency=filter_currency,
+        allow_empty_output=False,
+    )
+    ok, reason, metrics = evaluate_report(report, target_currency)
+    apply_report_metrics(triage_result, report)
+    if not ok:
+        attempts.append(
+            format_attempt(parser_name, "fail", reason, metrics, score_run(metrics))
+        )
+        triage_result.attempts_count = len(attempts)
+        triage_result.attempts_summary = "; ".join(attempts)
+        triage_result.failure_reason = reason
+        rows_exported = metrics.get("rows_exported", 0) or 0
+        if rows_exported > 0 and attempt_xlsx.exists():
+            final_xlsx = output_dir_path / f"{stem}.xlsx"
+            if final_xlsx.exists():
+                try:
+                    final_xlsx.unlink()
+                except OSError:
+                    LOGGER.warning("Could not remove existing output %s", final_xlsx)
+            try:
+                attempt_xlsx.rename(final_xlsx)
+            except OSError:
+                LOGGER.warning("Could not rename %s to %s", attempt_xlsx, final_xlsx)
+            triage_result.final_status = f"PARTIAL(parser={parser_name})"
+            triage_result.output_path = str(final_xlsx)
+            if debug_enabled:
+                debug_output.write_debug_json(
+                    pdf_path,
+                    triage_result,
+                    cached_pages,
+                    debug_dir,
+                    report=report,
+                    reason=reason,
+                )
+            return triage_result
+        triage_result.final_status = "FAILED(selected_parser_failed)"
+        if attempt_xlsx.exists():
+            try:
+                attempt_xlsx.unlink()
+            except OSError:
+                LOGGER.warning("Could not remove failed output %s", attempt_xlsx)
+        debug_output.write_debug_json(
+            pdf_path,
+            triage_result,
+            cached_pages,
+            debug_dir,
+            report=report,
+            reason=reason,
+            force=True,
+        )
+        return triage_result
+
+    selected["metrics"] = metrics
+    selected["score"] = score_run(metrics)
+    result = finalize_selection(triage_result, selected, attempts, output_dir_path, stem)
+    if debug_enabled:
+        debug_output.write_debug_json(
+            pdf_path,
+            triage_result,
+            cached_pages,
+            debug_dir,
+            report=report,
+            reason=triage_result.selection_reason,
+        )
+    return result
+
+
+def order_profiles(triage_result: TriageResult) -> List[str]:
+    ordered = []
+    if triage_result.art_no_count >= 20 and triage_result.rrp_count >= 20:
+        ordered.append("stelton_marker")
+    if triage_result.suggested_profile and triage_result.suggested_profile in PROFILE_ORDER:
+        if triage_result.suggested_profile not in ordered:
+            ordered.append(triage_result.suggested_profile)
+    for profile in PROFILE_ORDER:
+        if profile not in ordered:
+            ordered.append(profile)
+    return ordered
+
+
+def evaluate_report(report, currency: str) -> Tuple[bool, str, dict]:
+    metrics = build_metrics_from_report(report, currency)
+    return evaluate_metrics(metrics)
+
+
+def build_metrics_from_report(report, currency: str) -> dict:
+    exported = [row for row in report.rows if row.exported]
+    rows_exported = len(exported)
+    return {
+        "rows_exported": rows_exported,
+        "unique_code_ratio": compute_unique_code_ratio(exported),
+        "key_fields_rate": compute_key_fields_rate(exported, currency),
+        "review_rate": compute_review_rate(report),
+        "duplicate_conflicts_rate": compute_duplicate_conflicts_rate(report, rows_exported),
+        "duplicate_conflicts_count": report.duplicate_conflicts_count,
+    }
+
+
+def evaluate_metrics(metrics: dict) -> Tuple[bool, str, dict]:
+    rows_exported = metrics.get("rows_exported", 0) or 0
+    if rows_exported == 0:
+        return False, "no_valid_rows_found", metrics
+    if rows_exported < config.AUTO_ROWS_MIN:
+        return False, "too_few_rows", metrics
+
+    if metrics.get("duplicate_conflicts_count", 0) > 0:
+        return False, "duplicate_conflicts", metrics
+
+    if metrics.get("unique_code_ratio", 0.0) < config.AUTO_UNIQUE_CODE_RATIO_MIN:
+        return False, "low_unique_code_ratio", metrics
+    if metrics.get("key_fields_rate", 0.0) < config.AUTO_KEY_FIELDS_RATE_MIN:
+        return False, "low_key_fields_rate", metrics
+
+    return True, "passed", metrics
+
+
+def apply_report_metrics(triage_result: TriageResult, report) -> None:
+    total_rows = len(report.rows)
+    triage_result.rows_exported = int(report.rows_exported or 0)
+    triage_result.review_rows = int(report.rows_needs_review or 0)
+    triage_result.review_rate = (
+        triage_result.review_rows / total_rows if total_rows else 0.0
+    )
+    triage_result.rows_skipped_missing_target_currency = int(
+        report.skipped_missing_target_price or 0
+    )
+    triage_result.duplicate_art_no_count = int(report.duplicate_art_no_count or 0)
+    triage_result.duplicate_conflicts_count = int(
+        report.duplicate_conflicts_count or 0
+    )
+    triage_result.bad_art_no_count = int(report.bad_art_no_count or 0)
+    triage_result.corrected_art_no_count = int(report.corrected_art_no_count or 0)
+    triage_result.suspicious_numeric_art_no_seen = bool(
+        report.suspicious_numeric_art_no_seen
+    )
+    triage_result.examples_bad_art_no = report.examples_bad_art_no or []
+
+
+def compute_unique_code_ratio(rows) -> float:
+    codes = [text_utils.canonicalize_art_no(row.art_no) for row in rows if row.art_no]
+    if not rows:
+        return 0.0
+    if not codes:
+        return 0.0
+    return len(set(codes)) / len(rows)
+
+
+def compute_key_fields_rate(rows, currency: str) -> float:
+    if not rows:
+        return 0.0
+    key_fields = 0
+    for row in rows:
+        if row.art_no and get_price_by_currency(row, currency) is not None:
+            key_fields += 1
+    return key_fields / len(rows)
+
+
+def compute_review_rate_from_rows(rows) -> float:
+    if not rows:
+        return 1.0
+    needs_review = sum(1 for row in rows if row.needs_review)
+    return needs_review / len(rows)
+
+
+def get_price_by_currency(row, currency: str):
+    currency = currency.upper()
+    if currency == "DKK":
+        return row.price_dkk
+    if currency == "SEK":
+        return row.price_sek
+    if currency == "NOK":
+        return row.price_nok
+    return row.price_eur
+
+
+def format_attempt(
+    parser_name: str,
+    status: str,
+    reason: str,
+    metrics: dict,
+    score: Optional[float] = None,
+) -> str:
+    parts = [f"{parser_name}:{status}"]
+    if reason:
+        parts.append(reason)
+    if metrics:
+        metrics_parts = []
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                metrics_parts.append(f"{key}={value:.2f}")
+            else:
+                metrics_parts.append(f"{key}={value}")
+        if metrics_parts:
+            parts.append(",".join(metrics_parts))
+    if score is not None and "eval_score" not in (metrics or {}):
+        parts.append(f"score={score:.3f}")
+    return "(" + "|".join(parts) + ")"
+
+
+def extract_last_failure(attempt: str) -> str:
+    if not attempt:
+        return ""
+    stripped = attempt.strip("()")
+    parts = stripped.split("|")
+    if len(parts) >= 2:
+        return parts[1]
+    return ""
+
+
+def compute_review_rate(report) -> float:
+    return compute_review_rate_from_rows(report.rows)
+
+
+def compute_duplicate_conflicts_rate(report, rows_exported: int) -> float:
+    if rows_exported == 0:
+        return 0.0
+    return report.duplicate_conflicts_count / rows_exported
+
+
+def build_basic_metrics(rows, currency: str) -> dict:
+    exported = [row for row in rows if row.exported]
+    rows_exported = len(exported)
+    return {
+        "rows_exported": rows_exported,
+        "unique_code_ratio": compute_unique_code_ratio(exported),
+        "key_fields_rate": compute_key_fields_rate(exported, currency),
+        "review_rate": compute_review_rate_from_rows(rows),
+        "duplicate_conflicts_rate": 0.0,
+        "duplicate_conflicts_count": 0,
+    }
+
+
+def build_metrics_from_rows(rows, currency: str) -> dict:
+    exported = [row for row in rows if row.exported]
+    rows_exported = len(exported)
+    duplicate_summary = pipeline.analyze_duplicates(rows, currency)
+    duplicate_conflicts_count = duplicate_summary.get("conflicts_count", 0)
+    duplicate_conflicts_rate = (
+        duplicate_conflicts_count / rows_exported if rows_exported else 0.0
+    )
+    return {
+        "rows_exported": rows_exported,
+        "unique_code_ratio": compute_unique_code_ratio(exported),
+        "key_fields_rate": compute_key_fields_rate(exported, currency),
+        "review_rate": compute_review_rate_from_rows(rows),
+        "duplicate_conflicts_rate": duplicate_conflicts_rate,
+        "duplicate_conflicts_count": duplicate_conflicts_count,
+    }
+
+
+def evaluate_parser_fast(
+    cached_pages: List[page_cache.CachedPage],
+    parser_name: str,
+    source_file: str,
+    currency: str,
+    currency_only: Optional[str],
+    triage_result: Optional[TriageResult] = None,
+) -> dict:
+    start_time = time.monotonic()
+    max_seconds = config.AUTO_MAX_SECONDS_PER_PARSER_EVAL
+    target_currency = (currency or config.TARGET_CURRENCY).upper()
+    filter_currency = bool(currency_only)
+    parser = get_parser(parser_name)
+
+    if parser_name == "table_based":
+        ok, reason = table_precheck(parser, cached_pages, triage_result)
+        if not ok:
+            metrics = {
+                "eval_pages_used": 0,
+                "eval_rows": 0,
+                "eval_time_ms": int((time.monotonic() - start_time) * 1000),
+            }
+            metrics["eval_score"] = score_run(metrics)
+            return {
+                "parser": parser_name,
+                "ok": False,
+                "reason": reason,
+                "metrics": metrics,
+                "score": metrics["eval_score"],
+            }
+
+    rows = []
+    blocks = []
+    current_section = ""
+    processed_pages = 0
+    block_index = 0
+
+    for page in cached_pages:
+        elapsed = time.monotonic() - start_time
+        if elapsed >= max_seconds:
+            metrics = build_basic_metrics(rows, target_currency)
+            metrics.update(
+                {
+                    "eval_pages_used": processed_pages,
+                    "eval_rows": metrics.get("rows_exported", 0),
+                    "eval_time_ms": int(elapsed * 1000),
+                }
+            )
+            metrics["eval_score"] = score_run(metrics)
+            return {
+                "parser": parser_name,
+                "ok": False,
+                "reason": "eval_timeout",
+                "metrics": metrics,
+                "score": metrics["eval_score"],
+            }
+
+        if not page.normalized_text:
+            continue
+        processed_pages += 1
+        lines = page.lines
+        if not lines:
+            continue
+        section = parser.detect_section(lines)
+        if section:
+            current_section = section
+            lines = normalize.strip_section_line(lines, section)
+
+        page_blocks = parser.segment_blocks(lines)
+        for block_text in page_blocks:
+            notes = []
+            has_art_no = parser.contains_art_no(block_text)
+            has_price = bool(parser.price_pattern.search(block_text))
+            if not has_art_no and has_price:
+                if blocks and blocks[-1]["page"] in {
+                    page.page_number,
+                    page.page_number - 1,
+                }:
+                    blocks[-1]["raw_text"] += "\n" + block_text
+                    blocks[-1]["notes"].append("continuation_attached")
+                    continue
+                notes.append("orphan_block_no_art_no")
+            blocks.append(
+                {
+                    "page": page.page_number,
+                    "section": current_section,
+                    "raw_text": block_text,
+                    "ocr_used": page.ocr_used,
+                    "notes": notes,
+                }
+            )
+
+        for block in blocks[block_index:]:
+            sub_blocks, merged_note = parser.split_merged_block(block["raw_text"])
+            for sub_block in sub_blocks:
+                row, size_unparsed, parse_notes = parser.parse_block(
+                    raw_text=sub_block,
+                    page=block["page"],
+                    section=block["section"],
+                    source_file=source_file,
+                )
+                confidence, needs_review, notes = scoring.score_row(
+                    row=row,
+                    size_unparsed=size_unparsed,
+                    ocr_used=block.get("ocr_used", False),
+                    currency=target_currency,
+                )
+
+                row.confidence = confidence
+                row.needs_review = needs_review
+
+                combined_notes = parse_notes + notes + block.get("notes", [])
+                if merged_note:
+                    combined_notes.append(merged_note)
+
+                if row.art_no:
+                    row.art_no = text_utils.canonicalize_art_no(row.art_no)
+
+                invalid_price_note = f"invalid_price_{target_currency.lower()}"
+                force_review = merged_note in {
+                    "merged_block_unsplit",
+                    "possible_merged_block",
+                }
+                if invalid_price_note in parse_notes:
+                    force_review = True
+
+                art_no_count = len(parser.art_no_regex.findall(sub_block))
+                has_any_price = bool(parser.price_pattern.search(sub_block))
+                invalid_reasons = []
+                if art_no_count == 0 or not row.art_no:
+                    invalid_reasons.append("invalid_chunk_missing_art_no")
+                elif art_no_count > 1:
+                    invalid_reasons.append("invalid_chunk_multiple_art_no")
+                if not has_any_price:
+                    invalid_reasons.append("invalid_chunk_missing_price")
+                if not row.product_name_en:
+                    invalid_reasons.append("invalid_chunk_missing_name")
+                if invalid_reasons:
+                    row.exported = False
+                    row.needs_review = True
+                    combined_notes.extend(invalid_reasons)
+
+                if pipeline.is_degraded_art_no(sub_block, row.art_no):
+                    combined_notes.append("art_no_degraded")
+                    row.needs_review = True
+
+                row.notes = "; ".join(pipeline.unique_notes(combined_notes))
+                if force_review:
+                    row.needs_review = True
+
+                if filter_currency:
+                    pipeline.apply_currency_filter(row, target_currency)
+                    if pipeline.get_price_by_currency(row, target_currency) is None:
+                        continue
+
+                rows.append(row)
+        block_index = len(blocks)
+
+        early_reason = early_discard_reason(rows, target_currency, processed_pages)
+        if early_reason:
+            metrics = build_basic_metrics(rows, target_currency)
+            metrics.update(
+                {
+                    "eval_pages_used": processed_pages,
+                    "eval_rows": metrics.get("rows_exported", 0),
+                    "eval_time_ms": int((time.monotonic() - start_time) * 1000),
+                }
+            )
+            metrics["eval_score"] = score_run(metrics)
+            return {
+                "parser": parser_name,
+                "ok": False,
+                "reason": early_reason,
+                "metrics": metrics,
+                "score": metrics["eval_score"],
+            }
+
+    pipeline.apply_duplicate_policy(rows, target_currency)
+    pipeline.ensure_review_for_missing_prices(rows, target_currency)
+    metrics = build_metrics_from_rows(rows, target_currency)
+    metrics.update(
+        {
+            "eval_pages_used": processed_pages,
+            "eval_rows": metrics.get("rows_exported", 0),
+            "eval_time_ms": int((time.monotonic() - start_time) * 1000),
+        }
+    )
+    ok, reason, metrics = evaluate_metrics(metrics)
+    metrics["eval_score"] = score_run(metrics)
+    return {
+        "parser": parser_name,
+        "ok": ok,
+        "reason": reason,
+        "metrics": metrics,
+        "score": metrics["eval_score"],
+    }
+
+
+def early_discard_reason(rows, currency: str, pages_processed: int) -> str:
+    if pages_processed < 2:
+        return ""
+    exported = [row for row in rows if row.exported]
+    if not exported:
+        return "early_discard_no_rows"
+    if len(exported) < config.AUTO_ROWS_MIN:
+        return ""
+    unique_ratio = compute_unique_code_ratio(exported)
+    key_fields_rate = compute_key_fields_rate(exported, currency)
+    if unique_ratio < (config.AUTO_UNIQUE_CODE_RATIO_MIN * config.AUTO_EARLY_DISCARD_FACTOR):
+        return "early_discard_low_unique"
+    if key_fields_rate < (config.AUTO_KEY_FIELDS_RATE_MIN * config.AUTO_EARLY_DISCARD_FACTOR):
+        return "early_discard_low_key_fields"
+    return ""
+
+
+def table_precheck(parser, cached_pages: List[page_cache.CachedPage], triage_result):
+    if not cached_pages:
+        return False, "no_eval_pages"
+    page = next((item for item in cached_pages if item.table_hint), cached_pages[0])
+    column_lines = 0
+    header_found = False
+    for line in page.lines:
+        columns = parser._split_columns(line)
+        if parser._detect_header_map(columns):
+            header_found = True
+            break
+        if len(columns) >= config.TRIAGE_TABLE_MIN_COLUMNS:
+            column_lines += 1
+
+    if header_found:
+        return True, ""
+    if triage_result and triage_result.table_columns >= config.TRIAGE_TABLE_MIN_COLUMNS:
+        return True, ""
+    if column_lines >= 3:
+        return True, ""
+    return False, "table_precheck_failed"
+
+
+def score_run(metrics: dict) -> float:
+    key_fields_rate = metrics.get("key_fields_rate", 0.0) or 0.0
+    unique_ratio = metrics.get("unique_code_ratio", 0.0) or 0.0
+    review_rate = metrics.get("review_rate", 1.0) or 1.0
+    duplicate_conflicts_rate = metrics.get("duplicate_conflicts_rate", 0.0) or 0.0
+    return (
+        config.AUTO_SCORE_WEIGHT_KEY_FIELDS * key_fields_rate
+        + config.AUTO_SCORE_WEIGHT_UNIQUE * unique_ratio
+        - config.AUTO_SCORE_WEIGHT_REVIEW * review_rate
+        - config.AUTO_SCORE_WEIGHT_DUP_CONFLICT * duplicate_conflicts_rate
+    )
+
+
+def select_best_run(attempt_results: List[dict]) -> Optional[dict]:
+    valid = [item for item in attempt_results if item.get("ok")]
+    if not valid:
+        return None
+    valid.sort(
+        key=lambda item: (
+            item.get("score", 0.0),
+            item.get("metrics", {}).get("rows_exported", 0),
+            -(item.get("metrics", {}).get("review_rate", 1.0)),
+        ),
+        reverse=True,
+    )
+    return valid[0]
+
+
+def finalize_selection(
+    triage_result: TriageResult,
+    selection: dict,
+    attempts: List[str],
+    output_dir: Path,
+    stem: str,
+) -> TriageResult:
+    parser_name = selection.get("parser", "")
+    metrics = selection.get("metrics", {}) or {}
+    score = selection.get("score", 0.0)
+    final_xlsx = output_dir / f"{stem}.xlsx"
+    selected_path = output_dir / f"{stem}.{parser_name}.xlsx"
+    if final_xlsx.exists():
+        try:
+            final_xlsx.unlink()
+        except OSError:
+            LOGGER.warning("Could not remove existing output %s", final_xlsx)
+    if selected_path.exists():
+        try:
+            selected_path.rename(final_xlsx)
+        except OSError:
+            LOGGER.warning("Could not rename %s to %s", selected_path, final_xlsx)
+    for profile_id, parser in PROFILE_PARSER_MAP.items():
+        if parser == parser_name:
+            continue
+        extra_path = output_dir / f"{stem}.{parser}.xlsx"
+        if extra_path.exists():
+            try:
+                extra_path.unlink()
+            except OSError:
+                LOGGER.warning("Could not remove extra output %s", extra_path)
+    triage_result.final_status = f"CONVERTED(parser={parser_name})"
+    triage_result.final_parser = parser_name
+    triage_result.winner_parser = parser_name
+    triage_result.output_path = str(final_xlsx)
+    triage_result.attempts_count = len(attempts)
+    triage_result.attempts_summary = "; ".join(attempts)
+    triage_result.selection_reason = (
+        f"selected_score={score:.3f}"
+        f" key_fields_rate={metrics.get('key_fields_rate', 0):.2f}"
+        f" unique_code_ratio={metrics.get('unique_code_ratio', 0):.2f}"
+        f" review_rate={metrics.get('review_rate', 0):.2f}"
+    )
+    return triage_result
+
+
+def is_excellent(metrics: dict) -> bool:
+    return (
+        metrics.get("key_fields_rate", 0.0) >= config.AUTO_EXCELLENT_KEY_FIELDS_RATE_MIN
+        and metrics.get("review_rate", 1.0) <= config.AUTO_EXCELLENT_REVIEW_RATE_MAX
+    )

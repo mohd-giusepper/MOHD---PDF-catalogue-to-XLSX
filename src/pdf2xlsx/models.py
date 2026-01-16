@@ -43,14 +43,75 @@ class RunReport:
     rows_needs_review: int = 0
     missing_art_no: int = 0
     missing_price: int = 0
+    skipped_missing_target_price: int = 0
     rows_exported: int = 0
     duplicate_art_no_count: int = 0
     duplicate_art_no_top: List[tuple] = field(default_factory=list)
     duplicate_conflicts: List[str] = field(default_factory=list)
     duplicate_conflicts_count: int = 0
+    bad_art_no_count: int = 0
+    corrected_art_no_count: int = 0
+    suspicious_numeric_art_no_seen: bool = False
+    examples_bad_art_no: List[dict] = field(default_factory=list)
     review_reasons_top: List[tuple] = field(default_factory=list)
     target_currency: str = "EUR"
     examples_ok: List[ProductRow] = field(default_factory=list)
     examples_needs_review: List[ProductRow] = field(default_factory=list)
     page_stats: List[dict] = field(default_factory=list)
     config_info: dict = field(default_factory=dict)
+
+
+@dataclass
+class TriageResult:
+    source_file: str = ""
+    source_path: str = ""
+    pages_sampled: List[int] = field(default_factory=list)
+    suggested_profile: str = ""
+    support_score: float = 0.0
+    decision: str = ""
+    parser: str = ""
+    marker_score: float = 0.0
+    table_score: float = 0.0
+    code_price_score: float = 0.0
+    art_no_count: int = 0
+    rrp_count: int = 0
+    colli_count: int = 0
+    designer_count: int = 0
+    code_label_count: int = 0
+    description_label_count: int = 0
+    price_label_count: int = 0
+    price_count: int = 0
+    euro_count: int = 0
+    currency_code_count: int = 0
+    table_columns: int = 0
+    numeric_line_ratio: float = 0.0
+    text_len_total: int = 0
+    ocr_needed_pages: int = 0
+    ocr_used_pages: int = 0
+    reasons: str = ""
+    target_currency: str = ""
+    currency_confidence: float = 0.0
+    currency_counts: dict = field(default_factory=dict)
+    final_status: str = ""
+    final_parser: str = ""
+    winner_parser: str = ""
+    eval_time_ms_total: int = 0
+    output_path: str = ""
+    rows_exported: int = 0
+    review_rows: int = 0
+    review_rate: float = 0.0
+    rows_skipped_missing_target_currency: int = 0
+    duplicate_art_no_count: int = 0
+    duplicate_conflicts_count: int = 0
+    bad_art_no_count: int = 0
+    corrected_art_no_count: int = 0
+    suspicious_numeric_art_no_seen: bool = False
+    examples_bad_art_no: List[dict] = field(default_factory=list)
+    attempts_count: int = 0
+    attempts_summary: str = ""
+    attempts_detail: List[dict] = field(default_factory=list)
+    selection_reason: str = ""
+    failure_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)

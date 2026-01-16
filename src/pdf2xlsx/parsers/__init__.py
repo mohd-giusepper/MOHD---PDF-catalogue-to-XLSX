@@ -3,10 +3,14 @@ from typing import Dict, Type
 from pdf2xlsx import config
 from pdf2xlsx.parsers.base import BaseParser
 from pdf2xlsx.parsers.stelton_2025 import Stelton2025Parser
+from pdf2xlsx.parsers.table_based import TableBasedParser
+from pdf2xlsx.parsers.code_price_based import CodePriceParser
 
 
 REGISTRY: Dict[str, Type[BaseParser]] = {
     "stelton_2025": Stelton2025Parser,
+    "table_based": TableBasedParser,
+    "code_price_based": CodePriceParser,
 }
 
 

@@ -13,7 +13,7 @@ def main() -> int:
 
         return cli_main()
 
-    from pdf2xlsx.gui.app_tk import start as gui_start
+    from pdf2xlsx.gui.app_pygame import start as gui_start
 
     gui_start()
     return 0

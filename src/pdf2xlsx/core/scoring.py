@@ -8,10 +8,12 @@ def score_row(
     row: ProductRow,
     size_unparsed: bool = False,
     ocr_used: bool = False,
+    currency: str = config.TARGET_CURRENCY,
     threshold: float = config.CONFIDENCE_THRESHOLD,
 ) -> Tuple[float, bool, List[str]]:
     confidence = 1.0
     notes: List[str] = []
+    currency = (currency or config.TARGET_CURRENCY).upper()
 
     if ocr_used:
         confidence -= config.OCR_CONFIDENCE_PENALTY
@@ -22,9 +24,9 @@ def score_row(
     if not row.product_name_en:
         confidence -= 0.4
         notes.append("missing_product_name")
-    if row.price_eur is None:
+    if get_price_by_currency(row, currency) is None:
         confidence -= 0.2
-        notes.append("missing_price_eur")
+        notes.append(f"missing_price_{currency.lower()}")
     if row.size_raw and size_unparsed:
         confidence -= 0.1
         notes.append("size_unparsed")
@@ -46,3 +48,14 @@ def _missing_all_prices(row: ProductRow) -> bool:
         and row.price_nok is None
         and row.price_eur is None
     )
+
+
+def get_price_by_currency(row: ProductRow, currency: str):
+    currency = currency.upper()
+    if currency == "DKK":
+        return row.price_dkk
+    if currency == "SEK":
+        return row.price_sek
+    if currency == "NOK":
+        return row.price_nok
+    return row.price_eur

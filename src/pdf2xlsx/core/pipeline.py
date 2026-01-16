@@ -15,6 +15,12 @@ from pdf2xlsx.utils import text as text_utils
 
 
 LOGGER = logging.getLogger(__name__)
+ART_NO_LINE_RE = re.compile(r"Art\.?\s*no\.?\s*:", re.IGNORECASE)
+ART_NO_VALUE_RE = re.compile(
+    r"Art\.?\s*no\.?\s*:\s*([A-Z0-9]+(?:-[A-Z0-9]+)*)",
+    re.IGNORECASE,
+)
+LARGE_NUMBER_RE = re.compile(r"\b\d{6,}\b")
 
 
 def run_pipeline(
@@ -25,8 +31,10 @@ def run_pipeline(
     parser_name: Optional[str] = None,
     debug_blocks: int = 0,
     currency_only: Optional[str] = None,
+    filter_currency: bool = True,
     ocr: bool = False,
     debug_matches: bool = False,
+    allow_empty_output: bool = True,
     progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
 ) -> RunReport:
     parser = get_parser(parser_name or config.DEFAULT_PARSER)
@@ -36,7 +44,9 @@ def run_pipeline(
     debug_items: List[dict] = []
     current_section = ""
     page_stats: List[dict] = []
-    debug_art_no_samples = 5
+    debug_art_no_samples = 20
+    target_currency = (currency_only or config.TARGET_CURRENCY).upper()
+    skipped_missing_target_price = 0
 
     cleanup_output_dir(output_xlsx, debug_json)
 
@@ -109,36 +119,83 @@ def run_pipeline(
                 row=row,
                 size_unparsed=size_unparsed,
                 ocr_used=block.get("ocr_used", False),
+                currency=target_currency,
             )
 
             normalized_block = normalize.normalize_text(sub_block)
             raw_block_id = hashlib.sha1(
                 f"{block['page']}:{normalized_block}".encode("utf-8")
             ).hexdigest()
-            raw_snippet = " ".join(normalized_block.split())[:120]
+            raw_snippet = ""
 
             row.confidence = confidence
             row.needs_review = needs_review
             combined_notes = parse_notes + notes + block.get("notes", [])
             if merged_note:
                 combined_notes.append(merged_note)
+            art_line = ""
+            matched_art_no = ""
+            first_large_number_token = ""
+            for line in sub_block.splitlines():
+                if ART_NO_LINE_RE.search(line):
+                    art_line = line.strip()
+                    match = ART_NO_VALUE_RE.search(line)
+                    if match:
+                        matched_art_no = match.group(1).strip()
+                    large_match = LARGE_NUMBER_RE.search(line)
+                    if large_match:
+                        first_large_number_token = large_match.group(0)
+                    break
+
+            snippet_source = art_line or " ".join(normalized_block.split())
+            raw_snippet = snippet_source[:200]
             row.raw_block_id = raw_block_id
             row.raw_snippet = raw_snippet
 
+            if (
+                row.art_no
+                and row.art_no.isdigit()
+                and len(row.art_no) >= 6
+                and matched_art_no
+                and matched_art_no != row.art_no
+            ):
+                combined_notes.append("art_no_corrected")
+                LOGGER.info(
+                    "art_no_corrected raw=%s matched=%s line=%s",
+                    row.art_no,
+                    matched_art_no,
+                    art_line,
+                )
+                row.art_no_raw = matched_art_no
+                row.art_no = matched_art_no
+
             if row.art_no:
                 row.art_no = text_utils.canonicalize_art_no(row.art_no)
-            if debug_art_no_samples > 0 and row.art_no_raw:
+            if debug_art_no_samples > 0:
+                source_line = ""
+                for line in sub_block.splitlines():
+                    if line.strip():
+                        source_line = line.strip()
+                        break
+                art_no_canonical = canonical_art_no_key(
+                    row.art_no, art_line or row.raw_snippet or ""
+                )
+                starts_numeric = bool(re.match(r"\d", art_no_canonical))
                 LOGGER.info(
-                    "art_no_raw=%s art_no_canonical=%s",
-                    row.art_no_raw,
-                    row.art_no,
+                    "art_no_sample raw=%s canonical=%s matched_art_no=%s first_large_number_token=%s starts_numeric=%s name=%s source_line=%s",
+                    row.art_no_raw or "",
+                    art_no_canonical,
+                    matched_art_no or "",
+                    first_large_number_token or "",
+                    starts_numeric,
+                    row.product_name_en or "",
+                    source_line,
                 )
                 debug_art_no_samples -= 1
 
-            target_currency = (currency_only or "EUR").upper()
             invalid_price_note = f"invalid_price_{target_currency.lower()}"
             force_review = merged_note in {"merged_block_unsplit", "possible_merged_block"}
-            if invalid_price_note in parse_notes or "invalid_price_eur" in parse_notes:
+            if invalid_price_note in parse_notes:
                 force_review = True
 
             art_no_count = len(parser.art_no_regex.findall(sub_block))
@@ -157,10 +214,6 @@ def run_pipeline(
                 row.needs_review = True
                 combined_notes.extend(invalid_reasons)
 
-            if target_currency == "EUR" and row.price_eur is None:
-                combined_notes.append("missing_price_eur")
-                row.needs_review = True
-
             if is_degraded_art_no(sub_block, row.art_no):
                 combined_notes.append("art_no_degraded")
                 row.needs_review = True
@@ -169,8 +222,18 @@ def run_pipeline(
             if force_review:
                 row.needs_review = True
 
-            if currency_only:
-                apply_currency_filter(row, currency_only)
+            if filter_currency:
+                apply_currency_filter(row, target_currency)
+                if get_price_by_currency(row, target_currency) is None:
+                    skipped_missing_target_price += 1
+                    if skipped_missing_target_price <= 5:
+                        LOGGER.info(
+                            "Skipping row missing target currency price: currency=%s art_no=%s page=%s",
+                            target_currency,
+                            row.art_no or "",
+                            row.page,
+                        )
+                    continue
 
             rows.append(row)
 
@@ -187,8 +250,8 @@ def run_pipeline(
                     }
                 )
 
-    apply_duplicate_policy(rows, currency_only or "EUR")
-    ensure_review_for_missing_prices(rows, currency_only or "EUR")
+    apply_duplicate_policy(rows, target_currency)
+    ensure_review_for_missing_prices(rows, target_currency)
 
     if debug_json:
         for item in debug_items:
@@ -199,9 +262,32 @@ def run_pipeline(
             debug_json, {"pages": page_stats, "blocks": debug_items}
         )
 
-    xlsx_writer.write_xlsx(rows, output_xlsx)
+    exported_rows = [row for row in rows if row.exported]
+    if allow_empty_output or exported_rows:
+        temp_path = f"{output_xlsx}.tmp"
+        try:
+            xlsx_writer.write_xlsx(rows, temp_path)
+            Path(output_xlsx).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_xlsx).unlink(missing_ok=True)
+            Path(temp_path).replace(output_xlsx)
+        except OSError:
+            LOGGER.warning("Failed to write XLSX output for %s", output_xlsx)
+    else:
+        LOGGER.warning("No exported rows; skipping XLSX write for %s", output_xlsx)
+        try:
+            output_path = Path(output_xlsx)
+            if output_path.exists():
+                output_path.unlink()
+        except OSError:
+            LOGGER.warning("Could not remove empty XLSX output: %s", output_xlsx)
 
     needs_review_count = sum(1 for row in rows if row.needs_review)
+    if skipped_missing_target_price:
+        LOGGER.info(
+            "Skipped rows missing %s price: %d",
+            target_currency,
+            skipped_missing_target_price,
+        )
     LOGGER.info("Rows written: %d", len(rows))
     if rows:
         LOGGER.info(
@@ -211,15 +297,16 @@ def run_pipeline(
         )
     LOGGER.info("Output saved to %s", output_xlsx)
 
-    return build_report(rows, page_stats, currency_only)
+    return build_report(rows, page_stats, target_currency, skipped_missing_target_price)
 
 
 def build_report(
     rows: List[ProductRow],
     page_stats: List[dict],
-    currency_only: Optional[str],
+    target_currency: str,
+    skipped_missing_target_price: int,
 ) -> RunReport:
-    target_currency = (currency_only or "EUR").upper()
+    target_currency = (target_currency or config.TARGET_CURRENCY).upper()
     exported_rows = [row for row in rows if row.exported]
     missing_price = sum(
         1
@@ -228,6 +315,7 @@ def build_report(
     )
 
     duplicate_summary = analyze_duplicates(rows, target_currency)
+    art_no_quality = analyze_art_no_quality(rows)
     review_reasons = analyze_review_reasons(rows)
 
     report = RunReport(
@@ -238,11 +326,16 @@ def build_report(
         rows_needs_review=sum(1 for row in rows if row.needs_review),
         missing_art_no=sum(1 for row in rows if not row.art_no),
         missing_price=missing_price,
+        skipped_missing_target_price=skipped_missing_target_price,
         rows_exported=len(exported_rows),
         duplicate_art_no_count=duplicate_summary["count"],
         duplicate_art_no_top=duplicate_summary["top"],
         duplicate_conflicts=duplicate_summary["conflicts"],
         duplicate_conflicts_count=duplicate_summary["conflicts_count"],
+        bad_art_no_count=art_no_quality["bad_art_no_count"],
+        corrected_art_no_count=art_no_quality["corrected_art_no_count"],
+        suspicious_numeric_art_no_seen=art_no_quality["suspicious_numeric_art_no_seen"],
+        examples_bad_art_no=art_no_quality["examples_bad_art_no"],
         review_reasons_top=review_reasons,
         target_currency=target_currency,
         examples_ok=[row for row in rows if not row.needs_review][:3],
@@ -256,11 +349,23 @@ def build_report(
             "review_rate_threshold": config.REVIEW_RATE_THRESHOLD,
         },
     )
+    if art_no_quality["bad_art_no_count"] > 0:
+        LOGGER.warning(
+            "Bad art_no detected: count=%d suspicious_numeric=%s",
+            art_no_quality["bad_art_no_count"],
+            art_no_quality["suspicious_numeric_art_no_seen"],
+        )
+        for example in art_no_quality["examples_bad_art_no"]:
+            LOGGER.warning("bad_art_no_example: %s", example)
     return report
 
 
 def analyze_duplicates(rows: List[ProductRow], target_currency: str) -> dict:
-    art_nos = [text_utils.canonicalize_art_no(row.art_no) for row in rows if row.art_no]
+    art_nos = [
+        key
+        for row in rows
+        if (key := canonical_art_no_key(row.art_no, row.raw_snippet or ""))
+    ]
     counter = Counter(art_nos)
     duplicates = [(art_no, count) for art_no, count in counter.items() if count > 1]
     duplicates.sort(key=lambda item: (-item[1], item[0]))
@@ -268,9 +373,9 @@ def analyze_duplicates(rows: List[ProductRow], target_currency: str) -> dict:
     conflicts = []
     grouped = defaultdict(list)
     for row in rows:
-        if row.art_no:
-            normalized = text_utils.canonicalize_art_no(row.art_no)
-            grouped[normalized].append(row)
+        key = canonical_art_no_key(row.art_no, row.raw_snippet or "")
+        if key:
+            grouped[key].append(row)
 
     for art_no, group_rows in grouped.items():
         if len(group_rows) < 2:
@@ -284,15 +389,53 @@ def analyze_duplicates(rows: List[ProductRow], target_currency: str) -> dict:
         )
         if len(values) > 1:
             conflicts.append(art_no)
-            LOGGER.warning(
-                "Duplicate art_no conflict: %s (variants: %d)", art_no, len(values)
-            )
+            log_duplicate_conflict(art_no, group_rows, len(values))
 
     return {
         "count": len(duplicates),
         "top": duplicates[:10],
         "conflicts": conflicts,
         "conflicts_count": len(conflicts),
+    }
+
+
+def analyze_art_no_quality(rows: List[ProductRow]) -> dict:
+    bad_count = 0
+    corrected_count = 0
+    suspicious_seen = False
+    examples = []
+
+    for row in rows:
+        if "art_no_corrected" in (row.notes or ""):
+            corrected_count += 1
+        raw_text = row.raw_snippet or row.product_name_raw or ""
+        match = ART_NO_VALUE_RE.search(raw_text)
+        matched_art_no = match.group(1).strip() if match else ""
+        canonical = text_utils.canonicalize_art_no(row.art_no or "")
+        matched_canonical = text_utils.canonicalize_art_no(matched_art_no)
+        large_match = LARGE_NUMBER_RE.search(raw_text)
+        large_token = large_match.group(0) if large_match else ""
+        suspicious_numeric = canonical.isdigit() and len(canonical) >= 6 and match
+        mismatch = bool(match and canonical and matched_canonical and canonical != matched_canonical)
+        if suspicious_numeric:
+            suspicious_seen = True
+        if suspicious_numeric or mismatch:
+            bad_count += 1
+            if len(examples) < 5:
+                examples.append(
+                    {
+                        "art_no": canonical,
+                        "matched_art_no": matched_canonical,
+                        "first_large_number_token": large_token,
+                        "page": row.page or "",
+                    }
+                )
+
+    return {
+        "bad_art_no_count": bad_count,
+        "corrected_art_no_count": corrected_count,
+        "suspicious_numeric_art_no_seen": suspicious_seen,
+        "examples_bad_art_no": examples,
     }
 
 
@@ -308,7 +451,8 @@ def cleanup_output_dir(output_xlsx: str, debug_json: Optional[str]) -> None:
     if debug_json:
         keep.add(Path(debug_json).resolve())
 
-    patterns = ["*.xlsx", f"*{config.DEBUG_JSON_SUFFIX}"]
+    stem = output_path.stem
+    patterns = [f"{stem}*.xlsx", f"{stem}*{config.DEBUG_JSON_SUFFIX}"]
     for pattern in patterns:
         for path in target_dir.glob(pattern):
             if path.resolve() in keep:
@@ -347,6 +491,29 @@ def unique_notes(notes: List[str]) -> List[str]:
     return unique
 
 
+def canonical_art_no_key(value: str, raw_text: str = "") -> str:
+    key = text_utils.canonicalize_art_no(value or "")
+    if not key:
+        return ""
+    if not re.search(r"\d", key):
+        return ""
+    if key.isdigit() and len(key) >= 6 and raw_text and ART_NO_LINE_RE.search(raw_text):
+        return ""
+    return key
+
+
+def log_duplicate_conflict(duplicate_key: str, rows: List[ProductRow], variants: int) -> None:
+    LOGGER.warning("Duplicate art_no conflict: key=%s variants=%d", duplicate_key, variants)
+    for sample in rows[:3]:
+        LOGGER.warning(
+            "duplicate_sample art_no=%s name=%s page=%s raw_line=%s",
+            sample.art_no or "",
+            sample.product_name_en or "",
+            sample.page or "",
+            sample.raw_snippet or sample.product_name_raw or "",
+        )
+
+
 def is_degraded_art_no(raw_text: str, art_no: str) -> bool:
     if not art_no or "-" in art_no:
         return False
@@ -368,8 +535,8 @@ def ensure_review_for_missing_prices(rows: List[ProductRow], currency: str) -> N
     for row in rows:
         if not row.exported:
             continue
-        if currency == "EUR" and row.price_eur is None:
-            add_row_note(row, "missing_price_eur")
+        if get_price_by_currency(row, currency) is None:
+            add_row_note(row, f"missing_price_{currency.lower()}")
             row.needs_review = True
 
 
@@ -377,8 +544,8 @@ def apply_duplicate_policy(rows: List[ProductRow], currency: str) -> None:
     currency = currency.upper()
     grouped = defaultdict(list)
     for row in rows:
-        if row.art_no:
-            key = text_utils.canonicalize_art_no(row.art_no)
+        key = canonical_art_no_key(row.art_no, row.raw_snippet or "")
+        if key:
             row.art_no = key
             grouped[key].append(row)
 
@@ -481,6 +648,8 @@ def get_price_by_currency(row: ProductRow, currency: str) -> Optional[float]:
 
 
 def apply_currency_filter(row: ProductRow, currency_only: str) -> None:
+    if not currency_only:
+        return
     currency_only = currency_only.upper()
     if currency_only != "DKK":
         row.price_dkk = None

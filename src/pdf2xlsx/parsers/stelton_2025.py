@@ -12,7 +12,7 @@ class Stelton2025Parser(BaseParser):
     name = "stelton_2025"
     rrp_pattern = re.compile(r"\*\*\s*RRP", re.IGNORECASE)
     art_no_value_regex = re.compile(
-        r"\bArt\.?\s*no\.?\s*:\s*([A-Za-z0-9][A-Za-z0-9\-\/\.]*)",
+        r"Art\.?\s*no\.?\s*:\s*([A-Z0-9]+(?:-[A-Z0-9]+)*)",
         re.IGNORECASE,
     )
 
@@ -74,7 +74,22 @@ class Stelton2025Parser(BaseParser):
                     logger.warning("Art. no. line not parsed: %s", line.strip())
                     return "", ""
                 value = match.group(1).strip()
-                return self.validate_art_no(value, raw_value=line.strip()), value
+                if not re.search(r"\d", value):
+                    logger.warning("Art. no. value missing digits: %s", line.strip())
+                    return "", ""
+                canonical = self.validate_art_no(value, raw_value=line.strip())
+                large_token = ""
+                large_match = re.search(r"\b\d{6,}\b", line)
+                if large_match:
+                    large_token = large_match.group(0)
+                logger.info(
+                    "art_no_match raw=%s canonical=%s matched_art_no=%s first_large_number_token=%s",
+                    value,
+                    canonical,
+                    value,
+                    large_token,
+                )
+                return canonical, value
         return "", ""
 
     def parse_colli(self, text: str) -> Optional[int]:
