@@ -170,7 +170,7 @@ class App:
         )
         self.log_area.pack(fill="both", expand=True)
 
-        footer = ttk.Frame(self.root, padding=(16, 0, 16, 12))
+        footer = ttk.Frame(self.root, padding=(16, 6, 16, 14))
         footer.pack(fill="x")
         self.progress = ttk.Progressbar(
             footer,
@@ -178,15 +178,16 @@ class App:
             mode="determinate",
             style="Accent.Horizontal.TProgressbar",
         )
-        self.progress.pack(fill="x", pady=(0, 6))
+        self.progress.pack(fill="x", pady=(4, 10))
         status_row = ttk.Frame(footer)
-        status_row.pack(fill="x")
-        ttk.Label(status_row, textvariable=self.status_var, foreground=self._muted).pack(
-            side="left", anchor="w"
-        )
-        ttk.Label(status_row, textvariable=self.eta_var, foreground=self._muted).pack(
-            side="right", anchor="e"
-        )
+        status_row.pack(fill="x", pady=(0, 2))
+        ttk.Label(
+            status_row,
+            textvariable=self.status_var,
+            foreground=self._muted,
+            padding=(2, 0),
+        ).pack(side="left", anchor="w")
+        # ETA shown inline with status to keep progress info together.
 
         self._set_busy(False)
 
@@ -449,6 +450,19 @@ class App:
             return f"{hours:d}:{minutes:02d}:{sec:02d}"
         return f"{minutes:02d}:{sec:02d}"
 
+    def _build_progress_line(self, stage: str, filename: str, processed: int, total: int) -> str:
+        stage_label = "Analisi" if stage == "scan" else "Conversione"
+        count_label = f"{processed}/{total}" if total else ""
+        parts = [stage_label]
+        if filename:
+            parts.append(filename)
+        if count_label:
+            parts.append(count_label)
+        eta_text = self._format_eta()
+        if eta_text != "--:--":
+            parts.append(f"ETA {eta_text}")
+        return " | ".join(parts)
+
     def _set_progress_target(self, value: int, total: int) -> None:
         self.progress["maximum"] = max(1, total)
         self._progress_target = min(value, total)
@@ -495,10 +509,9 @@ class App:
                 if processed == 0:
                     self._reset_eta(stage)
                 self._update_eta(processed, total, stage)
-                if stage == "convert":
-                    self.status_var.set(f"Conversione {filename} ({processed}/{total})")
-                else:
-                    self.status_var.set(f"Analisi {filename} ({processed}/{total})")
+                self.status_var.set(
+                    self._build_progress_line(stage, filename, processed, total)
+                )
             elif kind == "scan_result":
                 row_index, result = item[1], item[2]
                 if 0 <= row_index < len(self.scan_results):

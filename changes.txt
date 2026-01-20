@@ -1,59 +1,46 @@
-Ruolo
-Agisci come Codex (senior engineer/maintainer). Devi rendere il triage/decisione di convertibilità robusto e veloce su PDF molto diversi, riusando la cache+early-stop già implementate in core/page_cache.py e senza creare logiche duplicate tra moduli.
+Obiettivo
+Ridurre drasticamente i false positive esportati in PRODUCTS, senza introdurre LLM e senza “hardcodare” un singolo PDF.
+Mantieni l’attuale architettura (page_cache → cached_pages → triage → auto_convert → writer), ma aggiungi guardrail deterministici.
 
-Vincolo architetturale (OBBLIGATORIO)
-- Tutta la logica di “quali pagine scansionare e con che budget” deve vivere in core/page_cache.py (o in un helper chiamato da page_cache).
-- core/triage.py e core/auto_convert.py devono CONSUMARE le CachedPage (con signal_score, price_like_count, cooccurrence_count, table_likelihood, ecc.) e non ricampionare in modo indipendente.
+Contesto (errore ricorrente)
+In alcuni listini, l’indice/sommario contiene pattern ripetuti tipo:
+  "100 2026 EUR ... 101 2026 EUR ..."
+Il sistema interpreta 2026 come price_eur e 100/101 come art_no e li esporta.
+Inoltre, molte righe tecniche hanno art_no numerico che in realtà è una misura (es. 234 cm, 143 cm, 180 cm) o valori tipo kg/Volume/Seat H.
 
-Obiettivo generale
-1) Sampling adattivo per numero pagine (percentuale + cap) + distribuzione (step+jitter).
-2) Ranking convertibilità con segnali cheap → poi words solo sulle candidate.
-3) Retry deterministico quando i segnali sono insufficienti (too_few_rows/table_precheck_failed/low_score).
-4) Output sempre (almeno XLSX diagnostico/summary), mai “nessun file”.
-5) Mantieni performance: niente scan completo di default.
-6) Mantieni compatibilità con GUI: progress callback stage coerenti (scan/convert/convert_page).
+Task 1 — Guardrail prezzo “anno”
+Nel resolver prezzo:
+- Se un candidato prezzo è un intero in range [1990, current_year+2] (es. 2026) e NON ha separatori migliaia né decimali tipici prezzo, allora NON considerarlo prezzo.
+- Se la riga contiene "EUR" vicino a quell’anno e compaiono più coppie "<num> <year> EUR" nella stessa riga, classifica come indice/nav e scarta (o manda a REVIEW) con reason "toc_year_price".
 
-STEP 1 (OBBLIGATORIO, prima di tutto)
-A) Sampling adattivo (percentuale + min/max + cap)
-Implementa in page_cache:
-- buckets generali (esempio):
-  <=30: 30% (min8 max15)
-  31–100: 15% (min12 max25)
-  101–300: 10% (min20 max40)
-  301–800: 3–5% (min30 max80)
-  >800: 1% (min40 max120)
-- selezione distribuita: step = num_pages/sample_count + jitter deterministico
-- integra early-stop già esistente: early-stop SOLO se trovi >=K pagine forti e score alto.
+Task 2 — Guardrail art_no numerico
+Nel resolver art_no:
+- Se art_no è solo cifre e nella stessa riga compaiono indicatori di dimensioni/unità (L/P/H/cm/Ø, Seat H, Volume, kg, m³, Fabric meters, quotes in inches "), allora NON accettare quell’art_no come prodotto esportabile.
+- In generale: numeric-only art_no deve essere “ambiguous” by default e finire in REVIEW, tranne se ci sono marker espliciti di codice (es. prefissi, label “code”, pattern noto, o cooccurrence forte codice+prezzo su più righe).
 
-B) Ranking cheap-first, expensive-later
-- per tutte le pagine campionate: calcola score cheap da text/lines (numeric_density, currency_tokens, price_like_count, cooccurrence_count, mixed_code_count, penalty legal).
-- solo per top_m candidate: extract_words() e aggiorna table_likelihood.
-- restituisci top_k pages finali (8–20) a triage/auto_convert.
+Task 3 — Penalità nel sampling / scelta pagine
+In page_cache scoring e/o selezione pages_sampled:
+- Penalizza fortemente pagine con table_likelihood alto ma mixed_code_count==0 e cooccurrence_count==0 (tipiche pagine indice/spec).
+- Regola il ranking in modo che il set campionato contenga almeno N pagine con cooccurrence_count>0 quando esistono nel budget; altrimenti attiva retry_scan con filtro “exclude_zero_cooccurrence_pages”.
 
-C) Retry deterministico
-Se triage/fast-eval porta a too_few_rows / low_score / precheck_failed:
-- Retry #1: aumenta sample_count (x2 o x3, cap 200) e rifai A–B.
-- Se ancora fallisce: salva XLSX diagnostico (summary) e termina “gracefully”.
+Task 4 — Page-level “toc detector” (cheap-first)
+Aggiungi una funzione cheap is_toc_like_page(text):
+- Se ci sono molte occorrenze di "<3-digit> <year> EUR" o "<digit> <year> EUR" o ripetizioni di year+EUR con numeri incrementali, ritorna True.
+Se True, la pagina non deve contribuire a export (o contribuisce solo a REVIEW), e deve aggiungere note tipo "toc_page_skipped".
 
-D) Output diagnostico sempre
-Se conversione produce 0 righe totali o non seleziona parser:
-- salva XLSX con SUMMARY che include:
-  num_pages, sample_count, pages_sampled, top_k pages + score, parser_attempts + reasons.
+Task 5 — Test deterministici
+Aggiungi unit test che coprano:
+- Riga "100 2026 EUR ... 101 2026 EUR ..." => non esportata, reason toc_year_price.
+- Riga "Sofa 234 cm Fabric meters ..." con art_no=234 => non esportata, reason numeric_dimension_artno.
+- Riga con "kg ... 177,16" => non interpretare 177.16 come prezzo se vicino a kg/quotes.
+I test devono essere indipendenti da PDF reali: usa stringhe sample/fixture.
 
-Logging obbligatorio
-- SAMPLE_COUNT num_pages=... sample_count=...
-- TOP_K pages=[...] scores=[...]
-- RETRY_SCAN reason=... old=... new=...
-- DIAGNOSTIC_OUTPUT written=...
-
-STEP 2 (DOPO che Step 1 passa smoke)
-E) Targeted sweep + OCR budgeted
-- Se Retry #1 fallisce: sweep 1 pagina ogni step largo (bucketed) finché trovi hit>threshold, poi espandi ±N e riprova.
-- OCR solo su pagine ocr_candidate (max_ocr_pages = min(30, sample_count//2)), e solo quando cheap signals suggeriscono tabella raster.
+Vincoli
+- Non cambiare UI/layout; cambia solo pipeline/triage/resolver/scoring/tests.
+- No nuove dipendenze.
+- Mantieni compatibilità con altri PDF: i guardrail devono essere condizionali e basati su segnali (EUR+anno+pattern ripetuti, unità di misura, cooccurrence).
+- Aggiorna il debug collector per includere nuovi discard_reasons e contatori (toc_year_price, toc_page_skipped, numeric_dimension_artno).
 
 Deliverable
-- Patch su core/page_cache.py + core/triage.py + core/auto_convert.py + config.py
-- Aggiorna test_smoke.py o aggiungi test minimale che verifica:
-  * sample_count cambia con num_pages (40/150/350/900)
-  * in too_few_rows scatta retry (log presente)
-  * viene sempre generato un XLSX diagnostico se fallisce
+- PR con modifiche + test verdi (unittest).
+- Nel run debug, voglio vedere contatori chiari: quante righe scartate per toc_year_price e quante pagine skippate per toc_page_skipped.

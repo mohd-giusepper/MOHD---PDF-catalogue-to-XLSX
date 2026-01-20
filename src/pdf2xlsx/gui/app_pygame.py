@@ -93,6 +93,7 @@ class App:
         self._progress_ratio_display = 0.0
         self._busy_label = ""
         self._stage = ""
+        self._progress_filename = ""
         self._eta_stage = ""
         self._eta_start = None
         self._eta_seconds = None
@@ -404,6 +405,21 @@ class App:
             return f"{hours:d}:{minutes:02d}:{sec:02d}"
         return f"{minutes:02d}:{sec:02d}"
 
+    def _build_progress_line(self) -> str:
+        stage = self._stage or ""
+        if not stage or self.progress_total <= 0:
+            return ""
+        stage_label = "Analisi" if stage == "scan" else "Conversione"
+        count_label = f"{self.progress_value}/{self.progress_total}"
+        parts = [stage_label]
+        if self._progress_filename:
+            parts.append(self._progress_filename)
+        parts.append(count_label)
+        eta_text = self._format_eta()
+        if eta_text != "--:--":
+            parts.append(f"ETA {eta_text}")
+        return " | ".join(parts)
+
     def _poll_queue(self) -> None:
         while True:
             try:
@@ -416,6 +432,7 @@ class App:
                 self.progress_total = total
                 self.progress_value = processed
                 self._stage = stage
+                self._progress_filename = filename
                 if total:
                     self._progress_ratio_target = processed / max(1, total)
                 else:
@@ -441,6 +458,7 @@ class App:
                 self.progress_total = total_selected
                 self.progress_value = processed
                 self._stage = "convert"
+                self._progress_filename = filename
                 if total_selected:
                     self._progress_ratio_target = processed / max(1, total_selected)
                 else:
@@ -462,6 +480,7 @@ class App:
                     self.scan_results = results
                 self._busy_label = ""
                 self._stage = ""
+                self._progress_filename = ""
                 self._reset_eta("")
                 self.status = "Analisi interrotta." if partial else "Analisi completata."
                 self._write_summary_async()
@@ -478,6 +497,7 @@ class App:
                 )
                 self._busy_label = ""
                 self._stage = ""
+                self._progress_filename = ""
                 self._reset_eta("")
                 self._write_summary_async()
             elif kind == "error":
@@ -717,43 +737,39 @@ class App:
                     row_y += row_height
 
             # Progress + status (bottom)
-            footer_rect = pygame.Rect(20, self.screen.get_height() - 52, self.screen.get_width() - 40, 36)
+            footer_height = 56
+            footer_rect = pygame.Rect(
+                20,
+                self.screen.get_height() - (footer_height + 12),
+                self.screen.get_width() - 40,
+                footer_height,
+            )
             pygame.draw.rect(self.screen, CARD, footer_rect, border_radius=10)
             pygame.draw.rect(self.screen, BORDER, footer_rect, 1, border_radius=10)
+            bar_rect = pygame.Rect(
+                footer_rect.x + 16,
+                footer_rect.y + 32,
+                footer_rect.width - 32,
+                12,
+            )
+            status_text = self.status
+            progress_text = self._build_progress_line()
+            if progress_text:
+                status_text = progress_text
+            max_chars = max(12, int((footer_rect.width - 32) / 7))
             self._draw_text(
-                self.status,
-                (footer_rect.x + 12, footer_rect.y + 9),
+                self._truncate(status_text, max_chars),
+                (footer_rect.x + 16, footer_rect.y + 10),
                 MUTED,
                 self.font_small,
             )
-            bar_rect = pygame.Rect(
-                footer_rect.right - 220,
-                footer_rect.y + 10,
-                200,
-                12,
-            )
-            pygame.draw.rect(self.screen, (230, 230, 230), bar_rect, border_radius=8)
             if self.progress_total:
+                pygame.draw.rect(self.screen, (230, 230, 230), bar_rect, border_radius=8)
                 ratio = min(1.0, self._progress_ratio_display)
                 fill_rect = pygame.Rect(
                     bar_rect.x, bar_rect.y, int(bar_rect.width * ratio), bar_rect.height
                 )
                 pygame.draw.rect(self.screen, (46, 160, 67), fill_rect, border_radius=8)
-            if self.progress_total:
-                progress_label = f"{self.progress_value}/{self.progress_total}"
-                self._draw_text(
-                    progress_label,
-                    (bar_rect.x - 40, bar_rect.y - 2),
-                    MUTED,
-                    self.font_small,
-                )
-                eta_label = f"ETA {self._format_eta()}"
-                self._draw_text(
-                    eta_label,
-                    (bar_rect.right + 8, bar_rect.y - 2),
-                    MUTED,
-                    self.font_small,
-                )
 
             pygame.display.flip()
             self.clock.tick(30)
