@@ -47,6 +47,8 @@ def _cache_key(
     ocr: bool,
     sample_multiplier: float,
     scan_mode: str,
+    exclude_zero_cooccurrence_pages: bool,
+    exclude_toc_pages: bool,
 ) -> str:
     try:
         stat = os.stat(pdf_path)
@@ -60,7 +62,9 @@ def _cache_key(
     ).hexdigest()
     raw = (
         f"{pdf_path}|{mtime}|{size}|{ocr}|{max_pages}|{min_text_len}|"
-        f"{sample_multiplier}|{scan_mode}|{stopwords_hash}|{config.CACHE_VERSION}"
+        f"{sample_multiplier}|{scan_mode}|{exclude_zero_cooccurrence_pages}|"
+        f"{exclude_toc_pages}|"
+        f"{stopwords_hash}|{config.CACHE_VERSION}"
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -73,6 +77,8 @@ def _cache_path(
     ocr: bool,
     sample_multiplier: float,
     scan_mode: str,
+    exclude_zero_cooccurrence_pages: bool,
+    exclude_toc_pages: bool,
 ) -> Path:
     cache_dir = Path(config.CACHE_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +90,8 @@ def _cache_path(
         ocr,
         sample_multiplier,
         scan_mode,
+        exclude_zero_cooccurrence_pages,
+        exclude_toc_pages,
     )
     return cache_dir / f"{key}.json"
 
@@ -111,6 +119,11 @@ def _deserialize_cached_pages(items: List[dict]) -> List["CachedPage"]:
                     mixed_code_count=int(item.get("mixed_code_count") or 0),
                     price_like_count=int(item.get("price_like_count") or 0),
                     cooccurrence_count=int(item.get("cooccurrence_count") or 0),
+                    toc_like=bool(item.get("toc_like")),
+                    toc_hard=bool(item.get("toc_hard")),
+                    toc_score=int(item.get("toc_score") or 0),
+                    cooccurrence_near_count=int(item.get("cooccurrence_near_count") or 0),
+                    row_candidate_count=int(item.get("row_candidate_count") or 0),
                 )
             )
         except Exception:
@@ -126,6 +139,8 @@ def _load_cached_signal_pages(
     ocr: bool,
     sample_multiplier: float,
     scan_mode: str,
+    exclude_zero_cooccurrence_pages: bool,
+    exclude_toc_pages: bool,
 ) -> Tuple[List["CachedPage"], List[str], dict]:
     if not config.CACHE_ENABLED:
         return [], [], {}
@@ -137,6 +152,8 @@ def _load_cached_signal_pages(
         ocr,
         sample_multiplier,
         scan_mode,
+        exclude_zero_cooccurrence_pages,
+        exclude_toc_pages,
     )
     if not cache_path.exists():
         return [], [], {}
@@ -165,6 +182,8 @@ def _save_cached_signal_pages(
     ocr: bool,
     sample_multiplier: float,
     scan_mode: str,
+    exclude_zero_cooccurrence_pages: bool,
+    exclude_toc_pages: bool,
     pages: List["CachedPage"],
     notes: List[str],
     meta: dict,
@@ -179,6 +198,8 @@ def _save_cached_signal_pages(
         ocr,
         sample_multiplier,
         scan_mode,
+        exclude_zero_cooccurrence_pages,
+        exclude_toc_pages,
     )
     payload = {
         "version": config.CACHE_VERSION,
@@ -211,31 +232,28 @@ class CachedPage:
     mixed_code_count: int = 0
     price_like_count: int = 0
     cooccurrence_count: int = 0
+    toc_like: bool = False
+    toc_hard: bool = False
+    toc_score: int = 0
+    cooccurrence_near_count: int = 0
+    row_candidate_count: int = 0
 
 
 def compute_sample_count(num_pages: int, multiplier: float = 1.0) -> int:
     if num_pages <= 0:
         return 0
-    if num_pages <= 30:
-        ratio = 0.30
-        min_count = 8
-        max_count = 15
-    elif num_pages <= 100:
+    if num_pages < 20:
         ratio = 0.15
-        min_count = 12
-        max_count = 25
-    elif num_pages <= 300:
+        min_count = 4
+        max_count = 10
+    elif num_pages < 100:
         ratio = 0.10
-        min_count = 20
-        max_count = 40
-    elif num_pages <= 800:
-        ratio = 0.04
-        min_count = 30
-        max_count = 80
+        min_count = 8
+        max_count = 20
     else:
         ratio = 0.01
-        min_count = 40
-        max_count = 120
+        min_count = 8
+        max_count = 25
     base = int(math.ceil(num_pages * ratio))
     base = max(min_count, min(max_count, base))
     if multiplier and multiplier > 1.0:
@@ -252,6 +270,111 @@ def compute_top_k_count(sample_count: int) -> int:
     return min(sample_count, target)
 
 
+def _select_top_k_pages(
+    pages: List["CachedPage"],
+    top_k_count: int,
+    min_cooccurrence_pages: int,
+    exclude_zero_cooccurrence_pages: bool,
+    exclude_toc_pages: bool,
+    min_top_k_count: int = 0,
+) -> Tuple[List["CachedPage"], dict]:
+    selection_meta = {
+        "toc_hard_excluded": 0,
+        "top_k_reintegrated": False,
+        "top_k_reintegrated_count": 0,
+        "top_k_collapse_reason": "",
+    }
+    if not pages or top_k_count <= 0:
+        return [], selection_meta
+    candidate_pages = pages
+    if exclude_toc_pages:
+        non_toc_pages = [page for page in pages if not page.toc_hard]
+        if len(non_toc_pages) >= top_k_count:
+            candidate_pages = non_toc_pages
+            selection_meta["toc_hard_excluded"] = sum(
+                1 for page in pages if page.toc_hard
+            )
+    cooc_pages = [page for page in candidate_pages if page.cooccurrence_count > 0]
+    if not cooc_pages:
+        cooc_pages = [
+            page for page in candidate_pages if page.cooccurrence_near_count > 0
+        ]
+    if exclude_zero_cooccurrence_pages and cooc_pages:
+        cooc_pages.sort(key=lambda item: item.signal_score, reverse=True)
+        selected = cooc_pages[: min(top_k_count, len(cooc_pages))]
+    else:
+        min_needed = min(min_cooccurrence_pages, top_k_count, len(cooc_pages))
+        selected = []
+        if min_needed > 0:
+            cooc_pages.sort(key=_page_sort_key, reverse=True)
+            selected.extend(cooc_pages[:min_needed])
+        if len(selected) < top_k_count:
+            selected_ids = {page.page_number for page in selected}
+            remaining = [
+                page
+                for page in candidate_pages
+                if page.page_number not in selected_ids
+            ]
+            remaining.sort(key=_page_sort_key, reverse=True)
+            selected.extend(remaining[: top_k_count - len(selected)])
+
+    if min_top_k_count and len(selected) < min_top_k_count:
+        selected_ids = {page.page_number for page in selected}
+        remaining = [
+            page
+            for page in candidate_pages
+            if page.page_number not in selected_ids
+        ]
+        remaining.sort(key=_collapse_sort_key, reverse=True)
+        before = len(selected)
+        for page in remaining:
+            if len(selected) >= min_top_k_count:
+                break
+            selected.append(page)
+        after = len(selected)
+        if after > before:
+            selection_meta["top_k_reintegrated"] = True
+            selection_meta["top_k_reintegrated_count"] = after - before
+        if len(selected) < min_top_k_count:
+            if exclude_toc_pages and sum(
+                1 for page in pages if not page.toc_hard
+            ) < min_top_k_count:
+                selection_meta["top_k_collapse_reason"] = "toc_hard_filtered"
+            elif len(pages) < min_top_k_count:
+                selection_meta["top_k_collapse_reason"] = "insufficient_candidates"
+            else:
+                selection_meta["top_k_collapse_reason"] = "post_filter_shortfall"
+
+    return selected, selection_meta
+
+
+def _page_sort_key(page: "CachedPage") -> Tuple[int, int, int, int, float]:
+    return (
+        int(page.row_candidate_count or 0),
+        int(page.cooccurrence_near_count or 0),
+        int(page.mixed_code_count or 0),
+        int(page.cooccurrence_count or 0),
+        float(page.signal_score or 0.0),
+    )
+
+
+def _collapse_sort_key(page: "CachedPage") -> Tuple[int, int, int, float]:
+    return (
+        int(page.row_candidate_count or 0),
+        int(page.cooccurrence_near_count or 0),
+        int(page.mixed_code_count or 0),
+        float(page.signal_score or 0.0),
+    )
+
+
+def _is_strong_hit(page: "CachedPage", has_stopword: bool) -> bool:
+    if has_stopword:
+        return False
+    if page.signal_score < config.CACHE_EARLY_STOP_SCORE:
+        return False
+    return page.cooccurrence_count > 0 or page.mixed_code_count > 0
+
+
 def _seed_for_sample(pdf_path: str, sample_multiplier: float, scan_mode: str) -> int:
     raw = f"{pdf_path}|{sample_multiplier}|{scan_mode}"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
@@ -264,6 +387,18 @@ def _select_sweep_pages(num_pages: int) -> Tuple[List[int], int]:
     step = max(config.CACHE_SWEEP_STEP_MIN, int(math.ceil(num_pages / config.CACHE_SWEEP_TARGET_PAGES)))
     pages = list(range(1, num_pages + 1, step))
     return pages, step
+
+
+def _augment_with_quartiles(pages: List[int], num_pages: int) -> List[int]:
+    if not pages or num_pages <= 0:
+        return pages
+    quartiles = {
+        max(1, int(math.ceil(num_pages * 0.25))),
+        max(1, int(math.ceil(num_pages * 0.50))),
+        max(1, int(math.ceil(num_pages * 0.75))),
+    }
+    merged = sorted(set(pages).union(quartiles))
+    return merged
 
 
 def select_sample_pages(
@@ -307,26 +442,60 @@ def _count_legal_hits(lower_text: str) -> int:
     return hits
 
 
-def _line_signal_counts(lines: List[str]) -> Tuple[int, int, int]:
+def _line_signal_counts(lines: List[str]) -> Tuple[int, int, int, int, int]:
     price_like_count = 0
     mixed_code_count = 0
     cooccurrence_count = 0
+    price_like_flags: List[bool] = []
+    price_candidate_flags: List[bool] = []
+    code_counts: List[int] = []
+
     for line in lines:
         if not line:
+            price_like_flags.append(False)
+            price_candidate_flags.append(False)
+            code_counts.append(0)
             continue
         line_info = text_utils.analyze_line(line)
         price_like = bool(line_info.get("price_like"))
+        price_candidates = bool(line_info.get("candidates"))
+        price_like_flags.append(price_like)
+        price_candidate_flags.append(price_candidates)
         if price_like:
             price_like_count += 1
         code_count = 0
         for token in _CODE_TOKEN_RE.findall(line):
             if text_utils.is_plausible_code(token, min_len=config.CODE_MIN_LEN):
                 code_count += 1
+        code_counts.append(code_count)
         if code_count:
             mixed_code_count += code_count
         if price_like and code_count:
             cooccurrence_count += 1
-    return price_like_count, mixed_code_count, cooccurrence_count
+
+    window = max(1, int(config.CACHE_COOCCURRENCE_NEAR_WINDOW))
+    cooccurrence_near_count = 0
+    row_candidate_count = 0
+    for idx, code_count in enumerate(code_counts):
+        if code_count <= 0:
+            continue
+        start = max(0, idx - window)
+        end = min(len(price_like_flags) - 1, idx + window)
+        has_price_near = any(
+            price_like_flags[i] or price_candidate_flags[i]
+            for i in range(start, end + 1)
+        )
+        if has_price_near:
+            cooccurrence_near_count += 1
+            row_candidate_count += 1
+
+    return (
+        price_like_count,
+        mixed_code_count,
+        cooccurrence_count,
+        cooccurrence_near_count,
+        row_candidate_count,
+    )
 
 
 def _compute_signal_score(
@@ -355,6 +524,31 @@ def _compute_signal_score(
     return score
 
 
+def _compute_toc_flags(
+    text: str,
+    mixed_code_count: int,
+    row_candidate_count: int,
+) -> Tuple[int, bool, bool]:
+    if not text:
+        return 0, False, False
+    pair_count = len(text_utils.extract_toc_year_price_pairs(text))
+    year_hits = text_utils.count_year_eur_hits(text)
+    short_numbers = text_utils.count_short_numbers(text)
+    score = pair_count * 2 + year_hits
+    if short_numbers >= config.TOC_PAGE_SHORT_NUMBER_MIN:
+        score += 1
+    if mixed_code_count <= 0:
+        score += 2
+    toc_like = score >= config.TOC_PAGE_SCORE_MIN
+    toc_hard = (
+        toc_like
+        and pair_count >= config.TOC_YEAR_PRICE_PAGE_MIN_MATCHES
+        and row_candidate_count <= config.TOC_HARD_ROW_CANDIDATE_MAX
+        and mixed_code_count <= config.TOC_HARD_MIXED_CODE_MAX
+    )
+    return score, toc_like, toc_hard
+
+
 def _compute_page_signals(
     text: str,
     normalized: str,
@@ -367,7 +561,18 @@ def _compute_page_signals(
     table_hint = _table_hint(lines)
     numeric_density = _numeric_density(normalized)
     currency_tokens = _collect_currency_tokens(text)
-    price_like_count, mixed_code_count, cooccurrence_count = _line_signal_counts(lines)
+    (
+        price_like_count,
+        mixed_code_count,
+        cooccurrence_count,
+        cooccurrence_near_count,
+        row_candidate_count,
+    ) = _line_signal_counts(lines)
+    toc_score, toc_like, toc_hard = _compute_toc_flags(
+        normalized,
+        mixed_code_count,
+        row_candidate_count,
+    )
     signal_score = _compute_signal_score(
         numeric_density=numeric_density,
         currency_tokens=currency_tokens,
@@ -388,6 +593,11 @@ def _compute_page_signals(
         "mixed_code_count": mixed_code_count,
         "cooccurrence_count": cooccurrence_count,
         "signal_score": signal_score,
+        "toc_score": toc_score,
+        "toc_like": toc_like,
+        "toc_hard": toc_hard,
+        "cooccurrence_near_count": cooccurrence_near_count,
+        "row_candidate_count": row_candidate_count,
     }
 
 
@@ -481,6 +691,8 @@ def build_signal_cache(
     scan_mode: str = "initial",
     force_rescan: bool = False,
     enable_ocr: bool = False,
+    exclude_zero_cooccurrence_pages: bool = False,
+    exclude_toc_pages: bool = False,
 ) -> Tuple[List[CachedPage], List[str], dict]:
     cached_pages, cached_notes, cached_meta = _load_cached_signal_pages(
         pdf_path=pdf_path,
@@ -490,6 +702,8 @@ def build_signal_cache(
         ocr=ocr,
         sample_multiplier=sample_multiplier,
         scan_mode=scan_mode,
+        exclude_zero_cooccurrence_pages=exclude_zero_cooccurrence_pages,
+        exclude_toc_pages=exclude_toc_pages,
     )
     if cached_pages and not force_rescan:
         return cached_pages, cached_notes, cached_meta
@@ -513,6 +727,8 @@ def build_signal_cache(
         else:
             sample_count = compute_sample_count(total_pages, sample_multiplier)
             sampled_pages = select_sample_pages(total_pages, sample_count, seed)
+            if scan_mode.startswith("retry"):
+                sampled_pages = _augment_with_quartiles(sampled_pages, total_pages)
         sample_count = len(sampled_pages)
         LOGGER.info(
             "SAMPLE_COUNT num_pages=%s sample_count=%s mode=%s",
@@ -530,6 +746,13 @@ def build_signal_cache(
             normalized = normalize.normalize_text(text)
             lines = normalize.split_lines(normalized)
             signals = _compute_page_signals(text, normalized, lines, stopwords_lower)
+            signal_score = round(signals["signal_score"], 4)
+            if (
+                signals.get("toc_hard")
+                and signals.get("mixed_code_count", 0) == 0
+                and signals.get("cooccurrence_count", 0) == 0
+            ):
+                signal_score = max(0.0, signal_score - config.CACHE_TOC_PAGE_PENALTY)
             cached_page = CachedPage(
                 page_number=page_number,
                 text=text,
@@ -544,18 +767,20 @@ def build_signal_cache(
                 numeric_density=round(signals["numeric_density"], 4),
                 currency_tokens=signals["currency_tokens"],
                 table_likelihood=0.0,
-                signal_score=round(signals["signal_score"], 4),
+                signal_score=signal_score,
                 mixed_code_count=signals["mixed_code_count"],
                 price_like_count=signals["price_like_count"],
                 cooccurrence_count=signals["cooccurrence_count"],
+                toc_like=bool(signals.get("toc_like")),
+                toc_hard=bool(signals.get("toc_hard")),
+                toc_score=int(signals.get("toc_score") or 0),
+                cooccurrence_near_count=int(signals.get("cooccurrence_near_count") or 0),
+                row_candidate_count=int(signals.get("row_candidate_count") or 0),
             )
             candidates.append(cached_page)
             stopword_flags[page_number] = signals["has_stopword"]
             scanned_pages.append(page_number)
-            if (
-                not stopword_flags[page_number]
-                and cached_page.signal_score >= config.CACHE_EARLY_STOP_SCORE
-            ):
+            if _is_strong_hit(cached_page, stopword_flags[page_number]):
                 strong_hits += 1
             if (
                 scan_mode != "sweep"
@@ -598,6 +823,13 @@ def build_signal_cache(
                 normalized = normalize.normalize_text(text)
                 lines = normalize.split_lines(normalized)
                 signals = _compute_page_signals(text, normalized, lines, stopwords_lower)
+                signal_score = round(signals["signal_score"], 4)
+                if (
+                    signals.get("toc_hard")
+                    and signals.get("mixed_code_count", 0) == 0
+                    and signals.get("cooccurrence_count", 0) == 0
+                ):
+                    signal_score = max(0.0, signal_score - config.CACHE_TOC_PAGE_PENALTY)
                 cached_page = CachedPage(
                     page_number=page_number,
                     text=text,
@@ -612,10 +844,15 @@ def build_signal_cache(
                     numeric_density=round(signals["numeric_density"], 4),
                     currency_tokens=signals["currency_tokens"],
                     table_likelihood=0.0,
-                    signal_score=round(signals["signal_score"], 4),
+                    signal_score=signal_score,
                     mixed_code_count=signals["mixed_code_count"],
                     price_like_count=signals["price_like_count"],
                     cooccurrence_count=signals["cooccurrence_count"],
+                    toc_like=bool(signals.get("toc_like")),
+                    toc_hard=bool(signals.get("toc_hard")),
+                    toc_score=int(signals.get("toc_score") or 0),
+                    cooccurrence_near_count=int(signals.get("cooccurrence_near_count") or 0),
+                    row_candidate_count=int(signals.get("row_candidate_count") or 0),
                 )
                 candidates.append(cached_page)
                 stopword_flags[page_number] = signals["has_stopword"]
@@ -657,16 +894,35 @@ def build_signal_cache(
             page.table_hint = signals["table_hint"]
             page.numeric_density = round(signals["numeric_density"], 4)
             page.currency_tokens = signals["currency_tokens"]
-            page.signal_score = round(signals["signal_score"], 4)
+            signal_score = round(signals["signal_score"], 4)
+            if (
+                signals.get("toc_hard")
+                and signals.get("mixed_code_count", 0) == 0
+                and signals.get("cooccurrence_count", 0) == 0
+            ):
+                signal_score = max(0.0, signal_score - config.CACHE_TOC_PAGE_PENALTY)
+            page.signal_score = signal_score
             page.mixed_code_count = signals["mixed_code_count"]
             page.price_like_count = signals["price_like_count"]
             page.cooccurrence_count = signals["cooccurrence_count"]
+            page.toc_like = bool(signals.get("toc_like"))
+            page.toc_hard = bool(signals.get("toc_hard"))
+            page.toc_score = int(signals.get("toc_score") or 0)
+            page.cooccurrence_near_count = int(
+                signals.get("cooccurrence_near_count") or 0
+            )
+            page.row_candidate_count = int(signals.get("row_candidate_count") or 0)
             stopword_flags[page.page_number] = signals["has_stopword"]
 
     if not candidates:
         return [], [], {}
 
     top_k_count = min(max_pages, compute_top_k_count(sample_count))
+    min_top_k_count = 0
+    if scan_mode == "retry_no_rows":
+        min_top_k_count = min(config.CACHE_RETRY_MIN_TOP_K, sample_count)
+        top_k_count = max(top_k_count, min_top_k_count)
+        top_k_count = min(top_k_count, sample_count)
     words_top_m = max(config.CACHE_WORDS_TOP_M, top_k_count)
     candidates.sort(key=lambda item: item.signal_score, reverse=True)
     with pdfplumber.open(pdf_path) as pdf:
@@ -677,24 +933,87 @@ def build_signal_cache(
             words = pdf_page.extract_words() or []
             columns, ratio = _table_metrics_from_words(words)
             page.words = words
-            page.table_likelihood = round(columns + ratio * 5.0, 3)
+            table_likelihood = columns + ratio * 5.0
+            page.table_likelihood = round(table_likelihood, 3)
             page.signal_score = round(
                 page.signal_score + page.table_likelihood * config.CACHE_TABLE_LIKELIHOOD_WEIGHT,
                 4,
             )
+            if (
+                page.table_likelihood >= config.CACHE_TOC_TABLE_LIKELIHOOD_MIN
+                and page.mixed_code_count == 0
+                and page.cooccurrence_count == 0
+            ):
+                page.signal_score = round(
+                    max(0.0, page.signal_score - config.CACHE_TOC_TABLE_PENALTY),
+                    4,
+                )
+
+    if config.CACHE_TOC_SOFT_PENALTY < 1.0:
+        for page in candidates:
+            if page.toc_like and not page.toc_hard:
+                page.signal_score = round(
+                    page.signal_score * config.CACHE_TOC_SOFT_PENALTY, 4
+                )
 
     eligible = [
         page
         for page in candidates
         if page.text_len >= min_text_len and not stopword_flags.get(page.page_number, False)
     ]
-    if eligible:
-        eligible.sort(key=lambda item: item.signal_score, reverse=True)
-        selected = eligible[:top_k_count]
-    else:
-        candidates.sort(key=lambda item: item.signal_score, reverse=True)
-        selected = candidates[:top_k_count]
+    source_pages = eligible or candidates
+    if not eligible:
         notes.append("fallback_pages_used")
+    if scan_mode == "retry_no_rows" and min_top_k_count and len(source_pages) < min_top_k_count:
+        source_pages = candidates
+        notes.append("retry_min_top_k_candidates")
+    selected, selection_meta = _select_top_k_pages(
+        pages=source_pages,
+        top_k_count=top_k_count,
+        min_cooccurrence_pages=config.CACHE_MIN_COOCCURRENCE_PAGES,
+        exclude_zero_cooccurrence_pages=exclude_zero_cooccurrence_pages,
+        exclude_toc_pages=exclude_toc_pages,
+        min_top_k_count=min_top_k_count,
+    )
+    cooc_available = sum(
+        1
+        for page in source_pages
+        if page.cooccurrence_count > 0 or page.cooccurrence_near_count > 0
+    )
+    cooc_selected = sum(
+        1
+        for page in selected
+        if page.cooccurrence_count > 0 or page.cooccurrence_near_count > 0
+    )
+    min_required = min(config.CACHE_MIN_COOCCURRENCE_PAGES, top_k_count)
+    toc_like_candidates = sum(1 for page in candidates if page.toc_like)
+    toc_hard_candidates = sum(1 for page in candidates if page.toc_hard)
+    toc_available = sum(1 for page in source_pages if page.toc_hard)
+    toc_selected = sum(1 for page in selected if page.toc_hard)
+    toc_like_available = sum(1 for page in source_pages if page.toc_like)
+    toc_like_selected = sum(1 for page in selected if page.toc_like)
+    if cooc_available < min_required:
+        notes.append("cooccurrence_shortfall")
+    if exclude_zero_cooccurrence_pages and cooc_available:
+        notes.append("cooccurrence_only")
+    if exclude_toc_pages and toc_available:
+        notes.append("toc_filtered")
+    if selection_meta.get("top_k_collapse_reason"):
+        notes.append(f"top_k_collapse:{selection_meta.get('top_k_collapse_reason')}")
+
+    LOGGER.info(
+        "TOC_COUNTS candidates_like=%s candidates_hard=%s excluded_hard=%s",
+        toc_like_candidates,
+        toc_hard_candidates,
+        selection_meta.get("toc_hard_excluded", 0),
+    )
+    if selection_meta.get("top_k_collapse_reason"):
+        LOGGER.warning(
+            "TOP_K_COLLAPSE reason=%s selected=%s min_target=%s",
+            selection_meta.get("top_k_collapse_reason"),
+            len(selected),
+            min_top_k_count,
+        )
 
     top_pages = [page.page_number for page in selected]
     top_scores = [page.signal_score for page in selected]
@@ -708,6 +1027,25 @@ def build_signal_cache(
         "top_k_scores": top_scores,
         "scan_mode": scan_mode,
         "sample_multiplier": sample_multiplier,
+        "exclude_zero_cooccurrence_pages": exclude_zero_cooccurrence_pages,
+        "exclude_toc_pages": exclude_toc_pages,
+        "cooccurrence_pages_available": cooc_available,
+        "cooccurrence_pages_selected": cooc_selected,
+        "cooccurrence_min_required": min_required,
+        "cooccurrence_near_window": int(config.CACHE_COOCCURRENCE_NEAR_WINDOW),
+        "toc_pages_available": toc_available,
+        "toc_pages_selected": toc_selected,
+        "toc_like_pages_available": toc_like_available,
+        "toc_like_pages_selected": toc_like_selected,
+        "toc_like_pages_candidate": toc_like_candidates,
+        "toc_hard_pages_candidate": toc_hard_candidates,
+        "toc_hard_pages_excluded": int(selection_meta.get("toc_hard_excluded", 0) or 0),
+        "top_k_min_target": int(min_top_k_count or 0),
+        "top_k_reintegrated": bool(selection_meta.get("top_k_reintegrated", False)),
+        "top_k_reintegrated_count": int(
+            selection_meta.get("top_k_reintegrated_count", 0) or 0
+        ),
+        "top_k_collapse_reason": selection_meta.get("top_k_collapse_reason", ""),
     }
 
     _save_cached_signal_pages(
@@ -718,6 +1056,8 @@ def build_signal_cache(
         ocr=ocr,
         sample_multiplier=sample_multiplier,
         scan_mode=scan_mode,
+        exclude_zero_cooccurrence_pages=exclude_zero_cooccurrence_pages,
+        exclude_toc_pages=exclude_toc_pages,
         pages=selected,
         notes=notes,
         meta=meta,

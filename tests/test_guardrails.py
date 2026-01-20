@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from pdf2xlsx.core import pipeline
 from pdf2xlsx.io import xlsx_writer
 from pdf2xlsx.models import ProductRow
+from pdf2xlsx.parsers import get_parser
 from pdf2xlsx.utils import text as text_utils
 
 
@@ -40,8 +41,98 @@ class GuardrailTests(unittest.TestCase):
             line_info,
             token_info=token_info,
         )
-        self.assertTrue(ok)
-        self.assertEqual(reason, "")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "hard_art_no")
+
+    def test_year_price_blocked(self) -> None:
+        raw_text = "2026 EUR"
+        token_info = text_utils.resolve_row_fields(raw_text)
+        self.assertFalse(token_info.get("price_candidates"))
+
+    def test_toc_year_price_line_discarded(self) -> None:
+        parser = get_parser("stelton_2025")
+        raw_text = "100 2026 EUR ... 101 2026 EUR ..."
+        line_info = text_utils.analyze_line(raw_text)
+        row = ProductRow(
+            product_name_en="Index",
+            art_no="AB1234",
+            price_eur=120.0,
+        )
+        reason = pipeline.primary_discard_reason(
+            parser=parser,
+            row=row,
+            raw_text=raw_text,
+            line_info=line_info,
+        )
+        self.assertEqual(reason, "toc_year_price")
+
+    def test_toc_hard_vs_soft_page(self) -> None:
+        hard_lines = ["100 2026 EUR", "101 2026 EUR", "102 2026 EUR"]
+        hard_text = "\n".join(hard_lines)
+        hard_signals = pipeline.compute_page_signals(hard_lines)
+        self.assertTrue(
+            pipeline.is_toc_hard_page(
+                hard_text,
+                mixed_code_count=int(hard_signals.get("mixed_code_count", 0) or 0),
+                row_candidate_count=int(hard_signals.get("row_candidate_count", 0) or 0),
+            )
+        )
+
+        soft_lines = [
+            "AB12-34 Sofa 200 2026 EUR",
+            "CD56-78 Table 210 2026 EUR",
+            "EF90-12 Chair 220 2026 EUR",
+        ]
+        soft_text = "\n".join(soft_lines)
+        soft_signals = pipeline.compute_page_signals(soft_lines)
+        self.assertTrue(
+            pipeline.is_toc_like_page(
+                soft_text,
+                mixed_code_count=int(soft_signals.get("mixed_code_count", 0) or 0),
+            )
+        )
+        self.assertFalse(
+            pipeline.is_toc_hard_page(
+                soft_text,
+                mixed_code_count=int(soft_signals.get("mixed_code_count", 0) or 0),
+                row_candidate_count=int(soft_signals.get("row_candidate_count", 0) or 0),
+            )
+        )
+
+    def test_numeric_dimension_art_no_goes_to_review(self) -> None:
+        row = ProductRow(
+            product_name_en="Sofa",
+            art_no="234",
+            price_eur=1200.0,
+        )
+        raw_text = "Sofa 234 cm Fabric meters"
+        line_info = text_utils.analyze_line(raw_text)
+        token_info = text_utils.resolve_row_fields(raw_text)
+        ok, reason = pipeline.hard_validate_row(
+            row,
+            raw_text,
+            line_info,
+            token_info=token_info,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "numeric_dimension_artno")
+
+    def test_color_temp_not_art_no(self) -> None:
+        raw_text = "LED 2700K."
+        token_info = text_utils.resolve_row_fields(raw_text)
+        self.assertFalse(token_info.get("art_no_candidates"))
+        self.assertIsNone(token_info.get("selected_art_no"))
+
+    def test_short_grade_token_not_art_no(self) -> None:
+        raw_text = "L1"
+        token_info = text_utils.resolve_row_fields(raw_text)
+        self.assertFalse(token_info.get("art_no_candidates"))
+        self.assertIsNone(token_info.get("selected_art_no"))
+
+    def test_unit_context_blocks_price_candidate(self) -> None:
+        raw_text = "Weight kg 177,16"
+        token_info = text_utils.resolve_row_fields(raw_text)
+        self.assertFalse(token_info.get("price_candidates"))
 
     def test_ambiguous_numeric_token_flags_review(self) -> None:
         row = ProductRow(
@@ -52,7 +143,6 @@ class GuardrailTests(unittest.TestCase):
         raw_text = "12345 Chair"
         line_info = text_utils.analyze_line(raw_text)
         token_info = text_utils.resolve_row_fields(raw_text)
-        self.assertTrue(token_info.get("ambiguous_numeric"))
         ok, reason = pipeline.hard_validate_row(
             row,
             raw_text,
@@ -60,7 +150,7 @@ class GuardrailTests(unittest.TestCase):
             token_info=token_info,
         )
         self.assertFalse(ok)
-        self.assertEqual(reason, "ambiguous_price_vs_artno")
+        self.assertEqual(reason, "hard_art_no")
 
     def test_dimension_detection(self) -> None:
         raw_text = "AB12 Table 120 x 60 cm EUR 200"
@@ -120,8 +210,8 @@ class GuardrailTests(unittest.TestCase):
             line_info,
             token_info=token_info,
         )
-        self.assertTrue(ok)
-        self.assertEqual(reason, "")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "hard_art_no")
 
     def test_valid_row_passes_hard_validation(self) -> None:
         row = ProductRow(
@@ -140,6 +230,24 @@ class GuardrailTests(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertEqual(reason, "")
+
+    def test_blacklist_tokens_not_art_no(self) -> None:
+        for raw_text in ("2700K", "27W", "E27/E26", "T02/T03", "E"):
+            token_info = text_utils.resolve_row_fields(raw_text)
+            self.assertFalse(token_info.get("art_no_candidates"))
+            self.assertIsNone(token_info.get("selected_art_no"))
+
+    def test_noise_price_only_line(self) -> None:
+        raw_text = "EUR 1"
+        line_info = text_utils.analyze_line(raw_text)
+        token_info = text_utils.resolve_row_fields(raw_text)
+        row = ProductRow(
+            product_name_en="",
+            art_no="",
+            price_eur=None,
+        )
+        noise_reason = pipeline.classify_noise_row(row, raw_text, line_info, token_info)
+        self.assertEqual(noise_reason, "noise_price_only")
 
     def test_writer_exports_only_exported_rows(self) -> None:
         rows = [

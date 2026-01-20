@@ -91,6 +91,45 @@ def build_debug_payload(
         "pages_scanned_budget": config.TRIAGE_SAMPLE_PAGES_MAX,
         "pages_sampled": triage_result.pages_sampled or [],
         "page_metrics": build_page_metrics(cached_pages),
+        "cached_pages_source": getattr(triage_result, "cached_pages_source", ""),
+        "sampling_retry_triggered": bool(
+            getattr(triage_result, "sampling_retry_triggered", False)
+        ),
+        "sampling_retry_reason": getattr(triage_result, "sampling_retry_reason", ""),
+        "sampling_retry_count": int(
+            getattr(triage_result, "sampling_retry_count", 0) or 0
+        ),
+        "sampling_retry_old_sample_count": int(
+            getattr(triage_result, "sampling_retry_old_sample_count", 0) or 0
+        ),
+        "sampling_retry_new_sample_count": int(
+            getattr(triage_result, "sampling_retry_new_sample_count", 0) or 0
+        ),
+        "sampling_retry_pages_sampled_old": getattr(
+            triage_result, "sampling_retry_pages_sampled_old", []
+        )
+        or [],
+        "sampling_retry_pages_sampled_new": getattr(
+            triage_result, "sampling_retry_pages_sampled_new", []
+        )
+        or [],
+        "toc_like_pages_candidate": int(
+            getattr(triage_result, "toc_like_pages_candidate", 0) or 0
+        ),
+        "toc_hard_pages_candidate": int(
+            getattr(triage_result, "toc_hard_pages_candidate", 0) or 0
+        ),
+        "toc_hard_pages_excluded": int(
+            getattr(triage_result, "toc_hard_pages_excluded", 0) or 0
+        ),
+        "top_k_min_target": int(getattr(triage_result, "top_k_min_target", 0) or 0),
+        "top_k_reintegrated": bool(
+            getattr(triage_result, "top_k_reintegrated", False)
+        ),
+        "top_k_reintegrated_count": int(
+            getattr(triage_result, "top_k_reintegrated_count", 0) or 0
+        ),
+        "top_k_collapse_reason": getattr(triage_result, "top_k_collapse_reason", ""),
     }
 
     attempts = format_attempts(triage_result.attempts_detail or [])
@@ -100,6 +139,10 @@ def build_debug_payload(
         "rows_total": rows_total,
         "rows_exported": triage_result.rows_exported or 0,
         "review_rows": triage_result.review_rows or 0,
+        "rows_review": triage_result.review_rows or 0,
+        "rows_noise": getattr(report, "guardrail_counts", {}).get("noise_rows", 0)
+        if report
+        else 0,
         "review_rate": triage_result.review_rate or 0.0,
         "duplicates_count": triage_result.duplicate_conflicts_count or 0,
         "skipped_missing_currency_count": triage_result.rows_skipped_missing_target_currency or 0,
@@ -119,8 +162,13 @@ def build_debug_payload(
             "rows_after_filters": getattr(report, "rows_after_filters", 0),
             "discard_reasons": getattr(report, "discard_reasons", {}) or {},
             "discard_samples": getattr(report, "discard_samples", {}) or {},
+            "guardrail_counts": getattr(report, "guardrail_counts", {}) or {},
+            "page_skip_reasons": getattr(report, "page_skip_reasons", {}) or {},
             "duplicates_summary": getattr(report, "duplicates_summary", []) or [],
             "cooccurrence_samples": getattr(report, "cooccurrence_samples", []) or [],
+            "export_policy_mode": (getattr(report, "config_info", {}) or {}).get(
+                "export_policy_mode", ""
+            ),
         }
 
     if _needs_suggestions(triage_result):
@@ -219,6 +267,11 @@ def build_page_metrics(cached_pages: List[page_cache.CachedPage]) -> List[dict]:
                 "mixed_code_count": page.mixed_code_count,
                 "price_like_count": page.price_like_count,
                 "cooccurrence_count": page.cooccurrence_count,
+                "cooccurrence_near_count": getattr(page, "cooccurrence_near_count", 0),
+                "row_candidate_count": getattr(page, "row_candidate_count", 0),
+                "toc_like": bool(getattr(page, "toc_like", False)),
+                "toc_hard": bool(getattr(page, "toc_hard", False)),
+                "toc_score": int(getattr(page, "toc_score", 0) or 0),
             }
         )
     return metrics

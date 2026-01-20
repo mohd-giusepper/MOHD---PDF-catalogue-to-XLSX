@@ -29,6 +29,7 @@ class ProductRow:
     exported: bool = True
     raw_block_id: str = ""
     raw_snippet: str = ""
+    noise: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -65,6 +66,8 @@ class RunReport:
     discard_samples: dict = field(default_factory=dict)
     duplicates_summary: List[dict] = field(default_factory=list)
     cooccurrence_samples: List[str] = field(default_factory=list)
+    guardrail_counts: dict = field(default_factory=dict)
+    page_skip_reasons: dict = field(default_factory=dict)
     config_info: dict = field(default_factory=dict)
 
 
@@ -119,6 +122,21 @@ class TriageResult:
     attempts_detail: List[dict] = field(default_factory=list)
     selection_reason: str = ""
     failure_reason: str = ""
+    cached_pages_source: str = ""
+    sampling_retry_triggered: bool = False
+    sampling_retry_reason: str = ""
+    sampling_retry_count: int = 0
+    sampling_retry_old_sample_count: int = 0
+    sampling_retry_new_sample_count: int = 0
+    sampling_retry_pages_sampled_old: List[int] = field(default_factory=list)
+    sampling_retry_pages_sampled_new: List[int] = field(default_factory=list)
+    toc_like_pages_candidate: int = 0
+    toc_hard_pages_candidate: int = 0
+    toc_hard_pages_excluded: int = 0
+    top_k_min_target: int = 0
+    top_k_reintegrated: bool = False
+    top_k_reintegrated_count: int = 0
+    top_k_collapse_reason: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

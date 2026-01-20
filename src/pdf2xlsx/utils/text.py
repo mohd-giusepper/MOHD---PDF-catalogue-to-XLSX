@@ -13,7 +13,9 @@ _CURRENCY_RE = re.compile(
     r"(?:\u20ac|\bEUR\b|\bDKK\b|\bSEK\b|\bNOK\b|\bUSD\b|\bGBP\b|\bCHF\b|\bJPY\b|\bCAD\b|\bAUD\b)",
     re.IGNORECASE,
 )
-_UNIT_RE = re.compile(r"\b(cm|mm|mq|sqm|m2|kg|h\.|dia|diam)\b", re.IGNORECASE)
+_UNIT_RE = re.compile(
+    r"\b(cm|mm|mq|sqm|m2|m3|kg|h\.|dia|diam|m\u00b2|m\u00b3)\b", re.IGNORECASE
+)
 _NUMBER_TOKEN_RE = re.compile(
     r"\b\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?\b|\b\d{1,7}(?:[.,]\d{1,2})?\b"
 )
@@ -35,16 +37,47 @@ _CURRENCY_TOKENS = {
     "CAD",
     "AUD",
 }
+_YEAR_MIN = 2000
+_YEAR_MAX = 2026
+_TOC_YEAR_PRICE_RE = re.compile(
+    r"\b(?P<num>\d{1,3})\s+(?P<year>19\d{2}|20\d{2})\s+(?:EUR|\u20ac)\b",
+    re.IGNORECASE,
+)
+_YEAR_EUR_RE = re.compile(
+    r"\b(?:EUR|\u20ac)\s*(?P<year>19\d{2}|20\d{2})\b"
+    r"|\b(?P<year_alt>19\d{2}|20\d{2})\s*(?:EUR|\u20ac)\b",
+    re.IGNORECASE,
+)
+_SHORT_NUMBER_RE = re.compile(r"\b\d{1,3}\b")
+_CODE_LABEL_RE = re.compile(
+    r"\b(?:code|cod\.?|codice|art\.?\s*no\.?|item|ref\.?|nr\.?)\b",
+    re.IGNORECASE,
+)
+_MEASURE_CONTEXT_RE = re.compile(
+    r"\b(cm|mm|mq|sqm|m2|m3|kg|volume|seat\s*h|fabric\s*meters?)\b",
+    re.IGNORECASE,
+)
+_COLOR_TEMP_RE = re.compile(r"^\d{3,4}K\.?$", re.IGNORECASE)
+_SHORT_GRADE_TOKEN_RE = re.compile(r"^[A-Za-z]\d{1,2}$")
+_SPEC_CONTEXT_RE = re.compile(r"\b(led\s*/\s*m|led/m|dimmable|strip|bulb)\b", re.IGNORECASE)
+_WATT_RE = re.compile(r"^\d{1,3}\s*W$", re.IGNORECASE)
+_E_SOCKET_RE = re.compile(r"^E\d{2}(?:/E\d{2})?$", re.IGNORECASE)
+_T_SERIES_RE = re.compile(r"^T\d{2}(?:/T\d{2})+$", re.IGNORECASE)
+_SINGLE_LETTER_RE = re.compile(r"^[A-Za-z]$")
+_NUMBER_WITH_UNIT_RE = re.compile(
+    r"^\d+(?:[.,]\d+)?(?:cm|mm|m|m2|m3|sqm|mq|kg|m\u00b2|m\u00b3)$",
+    re.IGNORECASE,
+)
 _DIMENSION_X_RE = re.compile(
     r"^\d+(?:[.,]\d+)?(?:x\d+(?:[.,]\d+)?){1,2}(?:cm|mm|m)?$",
     re.IGNORECASE,
 )
 _DIMENSION_LABEL_RE = re.compile(
-    r"^(?:H|W|D|L|O)\s*\d+(?:[.,]\d+)?(?:\s*(?:cm|mm|m))?$",
+    r"^(?:H|W|D|L|O|P)\s*\d+(?:[.,]\d+)?(?:\s*(?:cm|mm|m))?$",
     re.IGNORECASE,
 )
 _DIMENSION_LABEL_PREFIX_RE = re.compile(
-    r"^(?:H|W|D|L|O)\d+(?:[.,]\d+)?(?:cm|mm|m)?$",
+    r"^(?:H|W|D|L|O|P)\d+(?:[.,]\d+)?(?:cm|mm|m)?$",
     re.IGNORECASE,
 )
 _X_TOKENS = {"x", "X", "\u00d7"}
@@ -62,17 +95,10 @@ def is_date_token(token: str) -> bool:
 def is_plausible_code(token: str, min_len: int = 5) -> bool:
     if not token:
         return False
-    cleaned = re.sub(r"\s+", "", token)
-    cleaned = cleaned.strip()
+    cleaned = re.sub(r"\s+", "", token).strip()
     if len(cleaned) < min_len:
         return False
-    if is_dimension_token(cleaned):
-        return False
-    if is_date_token(cleaned):
-        return False
-    if not any(char.isalpha() for char in cleaned):
-        return False
-    if not any(char.isdigit() for char in cleaned):
+    if not is_valid_art_no_token(cleaned, min_len=min_len):
         return False
 
     alnum = [char for char in cleaned if char.isalnum()]
@@ -96,6 +122,51 @@ def is_plausible_code(token: str, min_len: int = 5) -> bool:
         if transitions / max(1, len(alnum) - 1) > 0.7 and len(alnum) <= 8:
             return False
     if re.search(r"(.)\1\1", cleaned):
+        return False
+    return True
+
+
+def is_blacklisted_art_no_token(token: str) -> bool:
+    if not token:
+        return False
+    candidate = canonicalize_art_no(token)
+    if not candidate:
+        return False
+    if _COLOR_TEMP_RE.match(candidate):
+        return True
+    if _WATT_RE.match(candidate):
+        return True
+    if _E_SOCKET_RE.match(candidate):
+        return True
+    if _T_SERIES_RE.match(candidate):
+        return True
+    if _SINGLE_LETTER_RE.match(candidate):
+        return True
+    if _SHORT_GRADE_TOKEN_RE.match(candidate):
+        return True
+    return False
+
+
+def is_valid_art_no_token(token: str, min_len: int = 6) -> bool:
+    if not token:
+        return False
+    candidate = canonicalize_art_no(token)
+    if not candidate:
+        return False
+    min_len = max(min_len, 6)
+    if len(candidate) < min_len:
+        return False
+    if is_dimension_token(candidate):
+        return False
+    if is_date_token(candidate):
+        return False
+    if _NUMBER_WITH_UNIT_RE.match(candidate):
+        return False
+    if is_blacklisted_art_no_token(candidate):
+        return False
+    if not any(char.isalpha() for char in candidate):
+        return False
+    if not any(char.isdigit() for char in candidate):
         return False
     return True
 
@@ -133,6 +204,17 @@ def resolve_row_fields(line: str) -> Dict[str, object]:
     tokens = tokenize_line(line)
     consumed = set()
     dimension_candidates: List[str] = []
+    code_label_present = has_code_label(line)
+    dimension_context = _has_dimension_context(line, tokens)
+    unit_context_indices = _collect_unit_context_indices(tokens)
+    toc_year_price = is_toc_year_price_line(line) or is_toc_like_line(line)
+    spec_context = has_spec_context(line, tokens)
+    filtered_color_temp_code = 0
+    filtered_short_grade_token = 0
+    filtered_watt_code = 0
+    filtered_socket_code = 0
+    filtered_t_series_code = 0
+    filtered_single_letter_code = 0
 
     for idx, token in enumerate(tokens):
         if is_dimension_candidate_token(token):
@@ -175,11 +257,17 @@ def resolve_row_fields(line: str) -> Dict[str, object]:
 
     currency_indices = {i for i, token in enumerate(tokens) if is_currency_token(token)}
     price_candidates: List[Dict[str, object]] = []
+    year_price_blocked = 0
     for idx, token in enumerate(tokens):
         if idx in consumed:
             continue
+        if _is_unit_context(tokens, idx, unit_context_indices):
+            continue
         cleaned = strip_currency_token(token)
         if not _PRICE_TOKEN_RE.match(cleaned):
+            continue
+        if is_year_price_candidate(cleaned, token):
+            year_price_blocked += 1
             continue
         value = parse_price(cleaned)
         if value is None:
@@ -218,35 +306,33 @@ def resolve_row_fields(line: str) -> Dict[str, object]:
         candidate = canonicalize_art_no(token)
         if not candidate:
             continue
-        if re.search(r"[A-Za-z]", candidate) and re.search(r"\d", candidate):
+        if _COLOR_TEMP_RE.match(candidate):
+            filtered_color_temp_code += 1
+            continue
+        if _WATT_RE.match(candidate):
+            filtered_watt_code += 1
+            continue
+        if _E_SOCKET_RE.match(candidate):
+            filtered_socket_code += 1
+            continue
+        if _T_SERIES_RE.match(candidate):
+            filtered_t_series_code += 1
+            continue
+        if _SINGLE_LETTER_RE.match(candidate):
+            filtered_single_letter_code += 1
+            continue
+        if is_short_grade_token(candidate) and not code_label_present:
+            filtered_short_grade_token += 1
+            continue
+        if spec_context and not code_label_present and len(candidate) <= 5:
+            continue
+        if is_valid_art_no_token(candidate, min_len=6):
             art_no_candidates.append(
                 {
                     "token": candidate,
                     "score": 3,
                     "idx": idx,
                     "kind": "alnum",
-                }
-            )
-            continue
-        digits_only = re.sub(r"\D", "", candidate)
-        numeric_like = candidate.isdigit() or bool(re.fullmatch(r"\d+(?:[-./]\d+)+", candidate))
-        if numeric_like:
-            if idx in currency_indices or (idx - 1) in currency_indices or (idx + 1) in currency_indices:
-                continue
-            if _THOUSANDS_RE.match(token) or _DECIMAL_2_RE.search(token):
-                continue
-            if 3 <= len(digits_only) <= 6:
-                score = 2
-            elif 7 <= len(digits_only) <= 10:
-                score = 1
-            else:
-                continue
-            art_no_candidates.append(
-                {
-                    "token": candidate,
-                    "score": score,
-                    "idx": idx,
-                    "kind": "numeric",
                 }
             )
 
@@ -270,6 +356,15 @@ def resolve_row_fields(line: str) -> Dict[str, object]:
             )
             if not strong_alt_price:
                 ambiguous_numeric = True
+    numeric_art_no = bool(selected_art_no and selected_art_no.get("kind") == "numeric")
+    numeric_art_no_dimension = numeric_art_no and dimension_context
+    numeric_art_no_strong = False
+    if numeric_art_no:
+        if code_label_present:
+            numeric_art_no_strong = True
+        elif selected_price and selected_price.get("has_currency"):
+            numeric_art_no_strong = True
+    numeric_art_no_ambiguous = numeric_art_no and not numeric_art_no_strong
 
     consumed_name_indices = set(consumed)
     if selected_price:
@@ -295,6 +390,19 @@ def resolve_row_fields(line: str) -> Dict[str, object]:
         "selected_price": selected_price,
         "selected_art_no": selected_art_no,
         "ambiguous_numeric": ambiguous_numeric,
+        "numeric_art_no": numeric_art_no,
+        "numeric_art_no_dimension": numeric_art_no_dimension,
+        "numeric_art_no_strong": numeric_art_no_strong,
+        "numeric_art_no_ambiguous": numeric_art_no_ambiguous,
+        "toc_year_price": toc_year_price,
+        "year_price_blocked": year_price_blocked,
+        "filtered_color_temp_code": filtered_color_temp_code,
+        "filtered_short_grade_token": filtered_short_grade_token,
+        "filtered_watt_code": filtered_watt_code,
+        "filtered_socket_code": filtered_socket_code,
+        "filtered_t_series_code": filtered_t_series_code,
+        "filtered_single_letter_code": filtered_single_letter_code,
+        "spec_context": spec_context,
         "name": name,
     }
 
@@ -337,7 +445,7 @@ def is_unit_token(token: str) -> bool:
 def is_dimension_label_token(token: str) -> bool:
     if not token:
         return False
-    return token.upper() in {"H", "W", "D", "L", "O"}
+    return token.upper() in {"H", "W", "D", "L", "O", "P"}
 
 
 def is_dimension_candidate_token(token: str) -> bool:
@@ -360,45 +468,52 @@ def is_art_no_candidate_token(token: str) -> bool:
     candidate = canonicalize_art_no(token)
     if not candidate:
         return False
-    if re.search(r"[A-Za-z]", candidate) and re.search(r"\d", candidate):
-        return True
-    digits_only = re.sub(r"\D", "", candidate)
-    if candidate.isdigit() or re.fullmatch(r"\d+(?:[-./]\d+)+", candidate):
-        return 3 <= len(digits_only) <= 10
-    return False
+    return is_valid_art_no_token(candidate, min_len=6)
 
 
 def analyze_line(line: str) -> Dict[str, object]:
     line = line or ""
     has_currency = bool(_CURRENCY_RE.search(line))
     has_dimension = bool(_DIMENSION_IN_LINE_RE.search(line)) or bool(_UNIT_RE.search(line))
+    tokens = tokenize_line(line)
+    has_measure_context = _has_dimension_context(line, tokens)
     number_tokens = [match.group(0) for match in _NUMBER_TOKEN_RE.finditer(line)]
     candidates = []
-    for token in number_tokens:
-        value = parse_number(token)
+    unit_context_indices = _collect_unit_context_indices(tokens)
+    year_price_blocked = 0
+    for idx, token in enumerate(tokens):
+        if _is_unit_context(tokens, idx, unit_context_indices):
+            continue
+        cleaned = strip_currency_token(token)
+        if not _PRICE_TOKEN_RE.match(cleaned):
+            continue
+        if is_year_price_candidate(cleaned, token):
+            year_price_blocked += 1
+            continue
+        value = parse_number(cleaned)
         if value is None:
             continue
         score = 0
         if has_currency:
             score += 3
-        if _THOUSANDS_RE.match(token):
+        if _THOUSANDS_RE.match(cleaned):
             score += 2
-        if _DECIMAL_2_RE.search(token):
+        if _DECIMAL_2_RE.search(cleaned):
             score += 1
         if value >= 100:
             score += 1
         candidates.append(
             {
-                "token": token,
+                "token": cleaned,
                 "value": value,
                 "score": score,
-                "thousands": bool(_THOUSANDS_RE.match(token)),
+                "thousands": bool(_THOUSANDS_RE.match(cleaned)),
             }
         )
 
     best = max((item["score"] for item in candidates), default=0)
     max_value = max((item["value"] for item in candidates), default=0.0)
-    number_count = len(candidates)
+    number_count = len(number_tokens)
     price_like = False
     if best >= 3:
         price_like = True
@@ -407,8 +522,11 @@ def analyze_line(line: str) -> Dict[str, object]:
     elif best >= 1:
         price_like = (not has_dimension) and number_count <= 3 and max_value >= 10
 
+    if has_measure_context and not has_currency:
+        price_like = False
+
     dimension_line = False
-    if has_dimension:
+    if has_dimension or has_measure_context:
         dimension_line = True
     elif number_count >= 4 and best <= 2:
         dimension_line = True
@@ -417,11 +535,13 @@ def analyze_line(line: str) -> Dict[str, object]:
 
     return {
         "has_currency": has_currency,
-        "has_dimension": has_dimension,
+        "has_dimension": has_dimension or has_measure_context,
         "dimension_line": dimension_line,
         "number_count": number_count,
         "price_like": price_like,
         "candidates": candidates,
+        "toc_year_price": is_toc_year_price_line(line) or is_toc_like_line(line),
+        "year_price_blocked": year_price_blocked,
     }
 
 
@@ -482,6 +602,8 @@ def parse_number(value: str) -> Optional[float]:
 
 
 def parse_price(value: str, min_value: float = 0.01, max_value: float = 1_000_000) -> Optional[float]:
+    if is_year_price_candidate(value, value):
+        return None
     number = parse_number(value)
     if number is None:
         return None
@@ -505,3 +627,171 @@ def canonicalize_art_no(value: str) -> str:
 
 def normalize_art_no(value: str) -> str:
     return canonicalize_art_no(value)
+
+
+def _year_bounds() -> Tuple[int, int]:
+    return _YEAR_MIN, _YEAR_MAX
+
+
+def is_year_price_candidate(cleaned: str, raw_token: str) -> bool:
+    if not cleaned:
+        return False
+    if not cleaned.isdigit():
+        return False
+    if "," in raw_token or "." in raw_token:
+        return False
+    try:
+        value = int(cleaned)
+    except ValueError:
+        return False
+    year_min, year_max = _year_bounds()
+    return year_min <= value <= year_max
+
+
+def is_toc_year_price_line(line: str, min_pairs: int = 2) -> bool:
+    if not line:
+        return False
+    pairs = extract_toc_year_price_pairs(line)
+    if len(pairs) < min_pairs:
+        return False
+    distinct_nums = {item[0] for item in pairs}
+    return len(distinct_nums) >= min_pairs
+
+
+def extract_toc_year_price_pairs(text: str) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
+    if not text:
+        return pairs
+    year_min, year_max = _year_bounds()
+    for match in _TOC_YEAR_PRICE_RE.finditer(text):
+        try:
+            num = int(match.group("num"))
+            year = int(match.group("year"))
+        except ValueError:
+            continue
+        if year_min <= year <= year_max:
+            pairs.append((num, year))
+    return pairs
+
+
+def count_year_eur_hits(text: str) -> int:
+    if not text:
+        return 0
+    year_min, year_max = _year_bounds()
+    hits = 0
+    for match in _YEAR_EUR_RE.finditer(text):
+        year_text = match.group("year") or match.group("year_alt") or ""
+        try:
+            year = int(year_text)
+        except ValueError:
+            continue
+        if year_min <= year <= year_max:
+            hits += 1
+    return hits
+
+
+def count_short_numbers(text: str) -> int:
+    if not text:
+        return 0
+    return len(_SHORT_NUMBER_RE.findall(text))
+
+
+def count_plausible_code_tokens(text: str) -> int:
+    if not text:
+        return 0
+    tokens = tokenize_line(text)
+    return sum(
+        1 for token in tokens if is_plausible_code(token, min_len=5)
+    )
+
+
+def is_toc_like_line(line: str) -> bool:
+    if not line:
+        return False
+    if "EUR" not in line.upper() and "\u20ac" not in line:
+        return False
+    year_hits = count_year_eur_hits(line)
+    if year_hits <= 0:
+        return False
+    short_numbers = count_short_numbers(line)
+    if short_numbers < 3:
+        return False
+    return count_plausible_code_tokens(line) == 0
+
+
+def has_code_label(line: str) -> bool:
+    if not line:
+        return False
+    return bool(_CODE_LABEL_RE.search(line))
+
+
+def is_short_grade_token(token: str) -> bool:
+    if not token:
+        return False
+    return bool(_SHORT_GRADE_TOKEN_RE.match(token))
+
+
+def has_spec_context(line: str, tokens: List[str]) -> bool:
+    if not line:
+        return False
+    if _SPEC_CONTEXT_RE.search(line):
+        return True
+    for token in tokens:
+        if token.lower() in {"led/m", "dimmable", "strip", "bulb"}:
+            return True
+    return False
+
+
+def _has_dimension_context(line: str, tokens: List[str]) -> bool:
+    if not line:
+        return False
+    if _DIMENSION_IN_LINE_RE.search(line):
+        return True
+    if _UNIT_RE.search(line):
+        return True
+    if _MEASURE_CONTEXT_RE.search(line):
+        return True
+    if '"' in line:
+        return True
+    for token in tokens:
+        upper = token.upper()
+        if upper in {"L", "P", "H", "W", "D", "O", "Ø"}:
+            return True
+    return False
+
+
+def _collect_unit_context_indices(tokens: List[str]) -> set:
+    indices = set()
+    for idx, token in enumerate(tokens):
+        lower = token.lower()
+        upper = token.upper()
+        if _NUMBER_WITH_UNIT_RE.match(token):
+            indices.add(idx)
+            continue
+        if lower in {"cm", "mm", "m", "m2", "m3", "sqm", "mq", "kg", "volume"}:
+            indices.add(idx)
+            continue
+        if upper in {"L", "P", "H", "W", "D", "O", "Ø"}:
+            indices.add(idx)
+            continue
+        if lower in {"seat", "fabric", "meters", "meter"}:
+            indices.add(idx)
+            continue
+        if '"' in token:
+            indices.add(idx)
+            continue
+    return indices
+
+
+def _is_unit_context(tokens: List[str], idx: int, unit_indices: set) -> bool:
+    if idx in unit_indices:
+        return True
+    for offset in (-2, -1, 1, 2):
+        adj = idx + offset
+        if adj in unit_indices:
+            return True
+        if 0 <= adj < len(tokens) and '"' in tokens[adj]:
+            return True
+    if 0 <= idx < len(tokens) and '"' in tokens[idx]:
+        return True
+    return False

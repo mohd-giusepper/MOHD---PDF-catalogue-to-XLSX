@@ -56,11 +56,12 @@ def write_xlsx(rows: Iterable[ProductRow], output_path: str) -> None:
     review_sheet.append(review_headers)
 
     sorted_rows = sorted(rows, key=_sort_key)
-    exported_rows = [row for row in sorted_rows if row.exported]
+    visible_rows = [row for row in sorted_rows if not getattr(row, "noise", False)]
+    exported_rows = [row for row in visible_rows if row.exported]
     for row in exported_rows:
         row_dict = row.to_dict()
         products_sheet.append([row_dict.get(header) for header in HEADERS])
-    for row in sorted_rows:
+    for row in visible_rows:
         if row.needs_review or not row.exported:
             row_dict = row.to_dict()
             review_sheet.append([row_dict.get(header) for header in review_headers])
@@ -91,6 +92,44 @@ def write_diagnostic_summary(
     )
     summary_sheet.append(
         ["top_k_scores", _format_score_list(cache_meta.get("top_k_scores", []))]
+    )
+    summary_sheet.append(
+        ["export_policy_mode", cache_meta.get("export_policy_mode", "")]
+    )
+    summary_sheet.append(["rows_total", cache_meta.get("rows_total", 0)])
+    summary_sheet.append(["rows_exported", cache_meta.get("rows_exported", 0)])
+    summary_sheet.append(["rows_review", cache_meta.get("rows_review", 0)])
+    summary_sheet.append(["rows_noise", cache_meta.get("rows_noise", 0)])
+    guardrail_counts = cache_meta.get("guardrail_counts", {}) or {}
+    summary_sheet.append(
+        ["year_price_blocked", guardrail_counts.get("year_price_blocked", 0)]
+    )
+    summary_sheet.append(
+        ["filtered_color_temp_code", guardrail_counts.get("filtered_color_temp_code", 0)]
+    )
+    summary_sheet.append(
+        ["filtered_short_grade_token", guardrail_counts.get("filtered_short_grade_token", 0)]
+    )
+    summary_sheet.append(
+        ["filtered_watt_code", guardrail_counts.get("filtered_watt_code", 0)]
+    )
+    summary_sheet.append(
+        ["filtered_socket_code", guardrail_counts.get("filtered_socket_code", 0)]
+    )
+    summary_sheet.append(
+        ["filtered_t_series_code", guardrail_counts.get("filtered_t_series_code", 0)]
+    )
+    summary_sheet.append(
+        ["filtered_single_letter_code", guardrail_counts.get("filtered_single_letter_code", 0)]
+    )
+    summary_sheet.append(
+        ["table_stitcher_used_pages", guardrail_counts.get("table_stitcher_used_pages", 0)]
+    )
+    summary_sheet.append(
+        ["table_stitcher_rows_exported", guardrail_counts.get("table_stitcher_rows_exported", 0)]
+    )
+    summary_sheet.append(
+        ["partial_export", guardrail_counts.get("partial_export", 0)]
     )
 
     pages_sheet = workbook.create_sheet("TOP_K")

@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+import pdfplumber
+
 from pdf2xlsx import config
 from pdf2xlsx.core import normalize, page_cache, pipeline, scoring, triage
 from pdf2xlsx.io import xlsx_writer
@@ -82,6 +84,233 @@ def should_retry_fast_eval(attempt_results: List[dict]) -> str:
         if reason in RETRY_REASONS:
             return reason
     return ""
+
+
+def _should_retry_cooccurrence(cached_pages, cache_meta: dict) -> bool:
+    if not isinstance(cache_meta, dict):
+        return False
+    if (
+        "cooccurrence_min_required" not in cache_meta
+        and "cooccurrence_pages_selected" not in cache_meta
+    ):
+        return False
+    min_required = int(
+        cache_meta.get("cooccurrence_min_required", config.CACHE_MIN_COOCCURRENCE_PAGES)
+    )
+    if min_required <= 0:
+        return False
+    if cache_meta.get("exclude_zero_cooccurrence_pages"):
+        return False
+    selected = cache_meta.get("cooccurrence_pages_selected")
+    if selected is None:
+        selected = sum(
+            1
+            for page in cached_pages
+            if getattr(page, "cooccurrence_count", 0) > 0
+            or getattr(page, "cooccurrence_near_count", 0) > 0
+        )
+    return selected < min_required
+
+
+def _all_attempts_reason(attempt_results: List[dict], reason: str) -> bool:
+    if not attempt_results:
+        return False
+    return all(item.get("reason") == reason for item in attempt_results)
+
+
+def _all_attempts_zero_rows(attempt_results: List[dict]) -> bool:
+    if not attempt_results:
+        return False
+    for attempt in attempt_results:
+        metrics = attempt.get("metrics", {}) or {}
+        eval_rows = metrics.get("eval_rows")
+        if eval_rows is None:
+            eval_rows = metrics.get("rows_exported")
+        if eval_rows is None:
+            return False
+        if int(eval_rows or 0) > 0:
+            return False
+    return True
+
+
+def _eval_rows_from_attempt(attempt: dict) -> int:
+    metrics = attempt.get("metrics", {}) or {}
+    eval_rows = metrics.get("eval_rows")
+    if eval_rows is None:
+        eval_rows = metrics.get("rows_exported")
+    return int(eval_rows or 0)
+
+
+def select_review_only_attempt(
+    attempt_results: List[dict],
+    triage_result: Optional[TriageResult],
+) -> Optional[dict]:
+    candidates = [item for item in attempt_results if _eval_rows_from_attempt(item) > 0]
+    if not candidates:
+        return None
+    preferred_parser = ""
+    if triage_result and triage_result.suggested_profile:
+        preferred_parser = PROFILE_PARSER_MAP.get(triage_result.suggested_profile, "")
+    if preferred_parser:
+        for item in candidates:
+            if item.get("parser") == preferred_parser:
+                return item
+    candidates.sort(
+        key=lambda item: (
+            _eval_rows_from_attempt(item),
+            item.get("metrics", {}).get("eval_score", 0.0),
+            item.get("score", 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _sort_eval_pages(
+    pages: List[page_cache.CachedPage],
+) -> List[page_cache.CachedPage]:
+    def sort_key(page: page_cache.CachedPage) -> Tuple[int, int, int, int, float]:
+        return (
+            int(getattr(page, "row_candidate_count", 0) or 0),
+            int(getattr(page, "cooccurrence_near_count", 0) or 0),
+            int(getattr(page, "cooccurrence_count", 0) or 0),
+            int(getattr(page, "mixed_code_count", 0) or 0),
+            float(getattr(page, "signal_score", 0.0) or 0.0),
+        )
+
+    return sorted(pages, key=sort_key, reverse=True)
+
+
+def _ensure_cache_meta(
+    pdf_path: str,
+    cached_pages: List[page_cache.CachedPage],
+    cache_meta: Optional[dict],
+) -> dict:
+    meta = dict(cache_meta or {})
+    pages_sampled = meta.get("pages_sampled")
+    if not pages_sampled:
+        pages_sampled = [page.page_number for page in cached_pages if page.page_number]
+        meta["pages_sampled"] = pages_sampled
+    if not meta.get("sample_count"):
+        meta["sample_count"] = len(pages_sampled or [])
+    if not meta.get("top_k_pages"):
+        meta["top_k_pages"] = list(pages_sampled or [])
+    if not meta.get("top_k_scores"):
+        meta["top_k_scores"] = [
+            float(getattr(page, "signal_score", 0.0) or 0.0) for page in cached_pages
+        ]
+    if not meta.get("num_pages"):
+        total_pages = 0
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+        except Exception:
+            total_pages = max(pages_sampled or [0])
+            if not total_pages and cached_pages:
+                total_pages = len(cached_pages)
+        meta["num_pages"] = total_pages
+    if not meta.get("scan_mode"):
+        meta["scan_mode"] = "provided_cache" if cached_pages else ""
+    if "toc_like_pages_candidate" not in meta:
+        meta["toc_like_pages_candidate"] = sum(
+            1 for page in cached_pages if getattr(page, "toc_like", False)
+        )
+    if "toc_hard_pages_candidate" not in meta:
+        meta["toc_hard_pages_candidate"] = sum(
+            1 for page in cached_pages if getattr(page, "toc_hard", False)
+        )
+    if "toc_hard_pages_excluded" not in meta:
+        meta["toc_hard_pages_excluded"] = 0
+    if "top_k_min_target" not in meta:
+        meta["top_k_min_target"] = 0
+    if "top_k_reintegrated" not in meta:
+        meta["top_k_reintegrated"] = False
+    if "top_k_reintegrated_count" not in meta:
+        meta["top_k_reintegrated_count"] = 0
+    if "top_k_collapse_reason" not in meta:
+        meta["top_k_collapse_reason"] = ""
+    if "export_policy_mode" not in meta:
+        meta["export_policy_mode"] = config.EXPORT_POLICY_MODE
+    if "rows_total" not in meta:
+        meta["rows_total"] = 0
+    if "rows_exported" not in meta:
+        meta["rows_exported"] = 0
+    if "rows_review" not in meta:
+        meta["rows_review"] = 0
+    if "rows_noise" not in meta:
+        meta["rows_noise"] = 0
+    if "guardrail_counts" not in meta:
+        meta["guardrail_counts"] = {}
+    return meta
+
+
+def _inject_report_summary(cache_meta: dict, report) -> dict:
+    if not report:
+        return cache_meta
+    meta = dict(cache_meta or {})
+    meta["rows_total"] = len(getattr(report, "rows", []) or [])
+    meta["rows_exported"] = int(getattr(report, "rows_exported", 0) or 0)
+    meta["rows_review"] = int(getattr(report, "rows_needs_review", 0) or 0)
+    guardrail_counts = getattr(report, "guardrail_counts", {}) or {}
+    meta["guardrail_counts"] = guardrail_counts
+    meta["rows_noise"] = int(guardrail_counts.get("noise_rows", 0) or 0)
+    config_info = getattr(report, "config_info", {}) or {}
+    if config_info.get("export_policy_mode"):
+        meta["export_policy_mode"] = config_info.get("export_policy_mode")
+    return meta
+
+
+def _apply_sampling_debug(
+    triage_result: TriageResult,
+    cached_pages_source: str,
+    retry_count: int,
+    retry_reason: str,
+    retry_old_meta: Optional[dict] = None,
+    retry_new_meta: Optional[dict] = None,
+    cache_meta: Optional[dict] = None,
+) -> None:
+    if not triage_result:
+        return
+    triage_result.cached_pages_source = cached_pages_source
+    triage_result.sampling_retry_triggered = retry_count > 0
+    triage_result.sampling_retry_reason = retry_reason or ""
+    triage_result.sampling_retry_count = retry_count
+    if retry_old_meta:
+        triage_result.sampling_retry_old_sample_count = int(
+            retry_old_meta.get("sample_count", 0) or 0
+        )
+        triage_result.sampling_retry_pages_sampled_old = list(
+            retry_old_meta.get("pages_sampled", []) or []
+        )
+    if retry_new_meta:
+        triage_result.sampling_retry_new_sample_count = int(
+            retry_new_meta.get("sample_count", 0) or 0
+        )
+        triage_result.sampling_retry_pages_sampled_new = list(
+            retry_new_meta.get("pages_sampled", []) or []
+        )
+    if cache_meta:
+        triage_result.toc_like_pages_candidate = int(
+            cache_meta.get("toc_like_pages_candidate", 0) or 0
+        )
+        triage_result.toc_hard_pages_candidate = int(
+            cache_meta.get("toc_hard_pages_candidate", 0) or 0
+        )
+        triage_result.toc_hard_pages_excluded = int(
+            cache_meta.get("toc_hard_pages_excluded", 0) or 0
+        )
+        triage_result.top_k_min_target = int(
+            cache_meta.get("top_k_min_target", 0) or 0
+        )
+        triage_result.top_k_reintegrated = bool(
+            cache_meta.get("top_k_reintegrated", False)
+        )
+        triage_result.top_k_reintegrated_count = int(
+            cache_meta.get("top_k_reintegrated_count", 0) or 0
+        )
+        triage_result.top_k_collapse_reason = str(
+            cache_meta.get("top_k_collapse_reason", "") or ""
+        )
 
 
 def write_diagnostic_output(
@@ -235,7 +464,12 @@ def run_auto_for_pdf(
     code_patterns = label_utils.build_label_patterns(code_dict.get("fields", {}))
     stopwords = label_dict.get("stopwords") or config.TRIAGE_STOPWORDS
 
-    provided_cache = cached_pages is not None and triage_result is not None
+    provided_cache = cached_pages is not None
+    sampling_retry_count = 0
+    sampling_retry_reason = ""
+    sampling_retry_old_meta: Optional[dict] = None
+    sampling_retry_new_meta: Optional[dict] = None
+    cached_pages_source = "gui_reuse" if provided_cache else "resampled"
     if not provided_cache:
         cached_pages, page_notes, cache_meta = page_cache.build_signal_cache(
             pdf_path,
@@ -244,6 +478,34 @@ def run_auto_for_pdf(
             stopwords=stopwords,
             ocr=ocr,
         )
+        if _should_retry_cooccurrence(cached_pages, cache_meta):
+            sampling_retry_old_meta = _ensure_cache_meta(
+                pdf_path, cached_pages, cache_meta
+            )
+            old_sample = cache_meta.get("sample_count", len(cached_pages))
+            cached_pages, page_notes, cache_meta = page_cache.build_signal_cache(
+                pdf_path,
+                max_pages=config.TRIAGE_TOP_K_MAX,
+                min_text_len=config.TRIAGE_TEXT_LEN_MIN,
+                stopwords=stopwords,
+                ocr=ocr,
+                sample_multiplier=config.CACHE_SAMPLE_RETRY_MULTIPLIER,
+                scan_mode="retry_cooc",
+                force_rescan=True,
+                exclude_zero_cooccurrence_pages=True,
+                exclude_toc_pages=True,
+            )
+            sampling_retry_count += 1
+            sampling_retry_reason = "cooccurrence_shortfall"
+            cached_pages_source = "resampled"
+            sampling_retry_new_meta = _ensure_cache_meta(
+                pdf_path, cached_pages, cache_meta
+            )
+            LOGGER.info(
+                "RETRY_SCAN reason=cooccurrence_shortfall old=%s new=%s",
+                old_sample,
+                cache_meta.get("sample_count", len(cached_pages)),
+            )
         triage_result = triage.scan_cached_pages(
             pdf_path=pdf_path,
             cached_pages=cached_pages,
@@ -254,6 +516,24 @@ def run_auto_for_pdf(
     else:
         page_notes = []
         cache_meta = {}
+        if triage_result is None:
+            triage_result = triage.scan_cached_pages(
+                pdf_path=pdf_path,
+                cached_pages=cached_pages,
+                page_notes=page_notes,
+                marker_patterns=marker_patterns,
+                code_patterns=code_patterns,
+            )
+    cache_meta = _ensure_cache_meta(pdf_path, cached_pages, cache_meta)
+    _apply_sampling_debug(
+        triage_result,
+        cached_pages_source=cached_pages_source,
+        retry_count=sampling_retry_count,
+        retry_reason=sampling_retry_reason,
+        retry_old_meta=sampling_retry_old_meta,
+        retry_new_meta=sampling_retry_new_meta,
+        cache_meta=cache_meta,
+    )
 
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -289,7 +569,26 @@ def run_auto_for_pdf(
     selected = select_best_run(attempt_results)
 
     retry_reason = should_retry_fast_eval(attempt_results)
-    if not provided_cache and retry_reason:
+    retry_exclude_cooc = False
+    retry_exclude_toc = False
+    retry_scan_mode = "retry"
+    if _all_attempts_reason(attempt_results, "early_discard_no_rows"):
+        retry_reason = "early_discard_no_rows"
+        retry_exclude_cooc = True
+        retry_exclude_toc = True
+        retry_scan_mode = "retry_weak"
+    if _all_attempts_reason(attempt_results, "early_discard_no_rows") or _all_attempts_zero_rows(
+        attempt_results
+    ):
+        retry_reason = "all_parsers_early_discard_no_rows"
+        retry_exclude_cooc = False
+        retry_exclude_toc = True
+        retry_scan_mode = "retry_no_rows"
+    force_retry = retry_reason == "all_parsers_early_discard_no_rows"
+    if retry_reason and (force_retry or not provided_cache):
+        sampling_retry_old_meta = _ensure_cache_meta(
+            pdf_path, cached_pages, cache_meta
+        )
         old_sample = cache_meta.get("sample_count", len(cached_pages))
         cached_pages, page_notes, cache_meta = page_cache.build_signal_cache(
             pdf_path,
@@ -298,8 +597,16 @@ def run_auto_for_pdf(
             stopwords=stopwords,
             ocr=ocr,
             sample_multiplier=config.CACHE_SAMPLE_RETRY_MULTIPLIER,
-            scan_mode="retry",
+            scan_mode=retry_scan_mode,
             force_rescan=True,
+            exclude_zero_cooccurrence_pages=retry_exclude_cooc,
+            exclude_toc_pages=retry_exclude_toc,
+        )
+        sampling_retry_count += 1
+        sampling_retry_reason = retry_reason
+        cached_pages_source = "resampled"
+        sampling_retry_new_meta = _ensure_cache_meta(
+            pdf_path, cached_pages, cache_meta
         )
         LOGGER.info(
             "RETRY_SCAN reason=%s old=%s new=%s",
@@ -313,6 +620,16 @@ def run_auto_for_pdf(
             page_notes=page_notes,
             marker_patterns=marker_patterns,
             code_patterns=code_patterns,
+        )
+        cache_meta = _ensure_cache_meta(pdf_path, cached_pages, cache_meta)
+        _apply_sampling_debug(
+            triage_result,
+            cached_pages_source=cached_pages_source,
+            retry_count=sampling_retry_count,
+            retry_reason=sampling_retry_reason,
+            retry_old_meta=sampling_retry_old_meta,
+            retry_new_meta=sampling_retry_new_meta,
+            cache_meta=cache_meta,
         )
         target_currency, currency_confidence, currency_counts, filter_currency = (
             resolve_target_currency(
@@ -350,6 +667,15 @@ def run_auto_for_pdf(
             force_rescan=True,
             enable_ocr=True,
         )
+        sampling_retry_old_meta = _ensure_cache_meta(
+            pdf_path, cached_pages, cache_meta
+        )
+        sampling_retry_count += 1
+        sampling_retry_reason = "sweep"
+        cached_pages_source = "resampled"
+        sampling_retry_new_meta = _ensure_cache_meta(
+            pdf_path, cached_pages, cache_meta
+        )
         LOGGER.info(
             "RETRY_SCAN reason=sweep old=%s new=%s",
             old_sample,
@@ -361,6 +687,14 @@ def run_auto_for_pdf(
             page_notes=page_notes,
             marker_patterns=marker_patterns,
             code_patterns=code_patterns,
+        )
+        _apply_sampling_debug(
+            triage_result,
+            cached_pages_source=cached_pages_source,
+            retry_count=sampling_retry_count,
+            retry_reason=sampling_retry_reason,
+            retry_old_meta=sampling_retry_old_meta,
+            retry_new_meta=sampling_retry_new_meta,
         )
         target_currency, currency_confidence, currency_counts, filter_currency = (
             resolve_target_currency(
@@ -385,6 +719,48 @@ def run_auto_for_pdf(
     triage_result.attempts_detail = attempts_detail
     selected = select_best_run(attempt_results)
     if not selected:
+        review_candidate = None
+        if not fast_eval_only:
+            review_candidate = select_review_only_attempt(
+                attempt_results, triage_result
+            )
+        if review_candidate:
+            parser_name = review_candidate.get("parser", "")
+            review_pages = full_pages or [
+                page.page_number for page in cached_pages if page.page_number
+            ]
+            final_xlsx = output_dir_path / f"{stem}.xlsx"
+            report = pipeline.run_pipeline(
+                input_pdf=pdf_path,
+                output_xlsx=str(final_xlsx),
+                pages=review_pages,
+                debug_json=None,
+                parser_name=parser_name,
+                ocr=ocr,
+                currency_only=target_currency,
+                filter_currency=filter_currency,
+                allow_empty_output=True,
+                progress_callback=progress_callback,
+            )
+            apply_report_metrics(triage_result, report)
+            triage_result.final_status = f"OK(REVIEW_ONLY,parser={parser_name})"
+            triage_result.final_parser = parser_name
+            triage_result.winner_parser = parser_name
+            triage_result.output_path = str(final_xlsx)
+            triage_result.attempts_count = len(attempts)
+            triage_result.attempts_summary = "; ".join(attempts)
+            triage_result.selection_reason = (
+                f"review_only_eval_rows={_eval_rows_from_attempt(review_candidate)}"
+            )
+            if run_debug:
+                run_debug.add_pdf(
+                    pdf_path,
+                    triage_result,
+                    cached_pages,
+                    report=report,
+                    reason=triage_result.selection_reason,
+                )
+            return triage_result
         if triage_result.decision == "OK":
             triage_result.decision = "FORSE"
         triage_result.final_status = "FAILED(all_parsers)"
@@ -404,6 +780,7 @@ def run_auto_for_pdf(
             triage_result.failure_reason = extract_last_failure(attempts[-1])
         else:
             triage_result.failure_reason = "no_parsers_available"
+        cache_meta = _ensure_cache_meta(pdf_path, cached_pages, cache_meta)
         triage_result.output_path = write_diagnostic_output(
             output_dir=output_dir_path,
             stem=stem,
@@ -505,6 +882,8 @@ def run_auto_for_pdf(
                 attempt_xlsx.unlink()
             except OSError:
                 LOGGER.warning("Could not remove failed output %s", attempt_xlsx)
+        cache_meta = _ensure_cache_meta(pdf_path, cached_pages, cache_meta)
+        cache_meta = _inject_report_summary(cache_meta, report)
         triage_result.output_path = write_diagnostic_output(
             output_dir=output_dir_path,
             stem=stem,
@@ -570,9 +949,13 @@ def build_metrics_from_report(report, currency: str) -> dict:
 
 def evaluate_metrics(metrics: dict) -> Tuple[bool, str, dict]:
     rows_exported = metrics.get("rows_exported", 0) or 0
+    eval_pages = metrics.get("eval_pages_used", 0) or 0
     if rows_exported == 0:
         return False, "no_valid_rows_found", metrics
-    if rows_exported < config.AUTO_ROWS_MIN:
+    min_rows = config.AUTO_ROWS_MIN
+    if eval_pages and eval_pages <= config.AUTO_EVAL_MIN_PAGES_WEAK:
+        min_rows = 1
+    if rows_exported < min_rows:
         return False, "too_few_rows", metrics
 
     if metrics.get("unique_code_ratio", 0.0) < config.AUTO_UNIQUE_CODE_RATIO_MIN:
@@ -753,8 +1136,26 @@ def evaluate_parser_fast(
     current_section = ""
     processed_pages = 0
     block_index = 0
+    sorted_pages = _sort_eval_pages(cached_pages)
+    weak_signals = all(
+        getattr(page, "cooccurrence_count", 0) == 0 for page in cached_pages
+    )
+    min_pages_before_discard = (
+        config.AUTO_EVAL_MIN_PAGES_WEAK if weak_signals else 2
+    )
 
-    for page in cached_pages:
+    toc_hard_pages = [
+        page
+        for page in cached_pages
+        if pipeline.is_toc_hard_page(
+            page.normalized_text or "",
+            mixed_code_count=int(getattr(page, "mixed_code_count", 0) or 0),
+            row_candidate_count=int(getattr(page, "row_candidate_count", 0) or 0),
+        )
+    ]
+    allow_toc_pages = len(toc_hard_pages) == len(cached_pages)
+
+    for page in sorted_pages:
         elapsed = time.monotonic() - start_time
         if elapsed >= max_seconds:
             metrics = build_basic_metrics(rows, target_currency)
@@ -775,6 +1176,15 @@ def evaluate_parser_fast(
             }
 
         if not page.normalized_text:
+            continue
+        if (
+            not allow_toc_pages
+            and pipeline.is_toc_hard_page(
+                page.normalized_text or "",
+                mixed_code_count=int(getattr(page, "mixed_code_count", 0) or 0),
+                row_candidate_count=int(getattr(page, "row_candidate_count", 0) or 0),
+            )
+        ):
             continue
         processed_pages += 1
         lines = page.lines
@@ -837,6 +1247,8 @@ def evaluate_parser_fast(
                     row=row,
                     raw_text=flat_line,
                     line_info=line_info,
+                    token_info=token_info,
+                    export_policy_mode=config.EXPORT_POLICY_MODE,
                 )
                 if discard_reason:
                     if discard_reason == "bad_id" and (
@@ -873,6 +1285,9 @@ def evaluate_parser_fast(
 
                 if row.art_no:
                     row.art_no = text_utils.canonicalize_art_no(row.art_no)
+                valid_art_no = text_utils.is_valid_art_no_token(
+                    row.art_no or "", min_len=config.CODE_MIN_LEN
+                )
                 row.raw_snippet = flat_line[:200]
 
                 invalid_price_note = f"invalid_price_{target_currency.lower()}"
@@ -895,7 +1310,7 @@ def evaluate_parser_fast(
                 if pipeline.row_has_price(row):
                     has_any_price = True
                 invalid_reasons = []
-                if not row.art_no:
+                if not valid_art_no:
                     invalid_reasons.append("invalid_chunk_missing_art_no")
                 elif art_no_count > 1 and parser.name not in {"table_based", "code_price_based"}:
                     invalid_reasons.append("invalid_chunk_multiple_art_no")
@@ -910,11 +1325,18 @@ def evaluate_parser_fast(
                     row.needs_review = True
                     combined_notes.extend(invalid_reasons)
 
+                strong_signal = bool(
+                    pipeline.row_has_price(row)
+                    or line_info.get("price_like")
+                    or token_info.get("price_candidates")
+                )
                 hard_ok, hard_reason = pipeline.hard_validate_row(
                     row=row,
                     raw_text=flat_line,
                     line_info=line_info,
                     token_info=token_info,
+                    export_policy_mode=config.EXPORT_POLICY_MODE,
+                    strong_signal=strong_signal,
                 )
                 if not hard_ok:
                     row.exported = False
@@ -937,7 +1359,12 @@ def evaluate_parser_fast(
                 rows.append(row)
         block_index = len(blocks)
 
-        early_reason = early_discard_reason(rows, target_currency, processed_pages)
+        early_reason = early_discard_reason(
+            rows,
+            target_currency,
+            processed_pages,
+            min_pages=min_pages_before_discard,
+        )
         if early_reason:
             metrics = build_basic_metrics(rows, target_currency)
             metrics.update(
@@ -977,8 +1404,13 @@ def evaluate_parser_fast(
     }
 
 
-def early_discard_reason(rows, currency: str, pages_processed: int) -> str:
-    if pages_processed < 2:
+def early_discard_reason(
+    rows,
+    currency: str,
+    pages_processed: int,
+    min_pages: int = 2,
+) -> str:
+    if pages_processed < max(2, min_pages):
         return ""
     exported = [row for row in rows if row.exported]
     if not exported:

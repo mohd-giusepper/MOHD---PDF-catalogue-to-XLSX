@@ -7,7 +7,8 @@ from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Optional, Tuple
 
 from pdf2xlsx import config
-from pdf2xlsx.core import extract, normalize, scoring
+from pdf2xlsx.core import extract, normalize, scoring, triage
+from pdf2xlsx.core import table_stitcher
 from pdf2xlsx.io import json_debug, xlsx_writer
 from pdf2xlsx.models import ProductRow, RunReport
 from pdf2xlsx.parsers import get_parser
@@ -53,6 +54,8 @@ DIM_LABEL_RE = re.compile(
 HEADER_STRICT_KEYWORDS = [
     "listino",
     "legenda",
+    "index",
+    "indice",
     "cod.",
     "codice",
     "code",
@@ -94,6 +97,7 @@ def run_pipeline(
     page_stats: List[dict] = []
     debug_art_no_samples = 20
     target_currency = (currency_only or config.TARGET_CURRENCY).upper()
+    export_policy_mode = (config.EXPORT_POLICY_MODE or "strict").lower()
     skipped_missing_target_price = 0
     rows_candidate = 0
     rows_after_parsing = 0
@@ -101,6 +105,8 @@ def run_pipeline(
     discard_reasons: Counter = Counter()
     discard_samples: Dict[str, List[str]] = defaultdict(list)
     cooccurrence_samples: List[str] = []
+    page_skip_reasons: Counter = Counter()
+    guardrail_counts: Counter = Counter()
 
     cleanup_output_dir(output_xlsx, debug_json)
 
@@ -126,12 +132,29 @@ def run_pipeline(
             log_marker_debug(page.page_number, normalized)
         lines = normalize.split_lines(normalized)
         page_signals = compute_page_signals(lines)
+        table_columns, numeric_ratio = triage.table_metrics_from_words(page.words)
+        table_likelihood = table_columns + numeric_ratio * 5.0
+        page_stats[-1]["table_likelihood"] = round(table_likelihood, 3)
         LOGGER.info(
             "PAGE_SIG p=%d parser=%s sig=%s",
             page.page_number,
             parser.name,
             format_page_signals(page_signals),
         )
+        if is_toc_hard_page(
+            normalized,
+            mixed_code_count=int(page_signals.get("mixed_code_count", 0) or 0),
+            row_candidate_count=int(page_signals.get("row_candidate_count", 0) or 0),
+        ):
+            page_skip_reasons["toc_page_skipped"] += 1
+            guardrail_counts["toc_page_skipped"] += 1
+            page_stats[-1]["skip_reason"] = "toc_page_skipped"
+            LOGGER.warning(
+                "SKIP_PAGE toc_like p=%d parser=%s",
+                page.page_number,
+                parser.name,
+            )
+            continue
         if is_text_like_page(page_signals, parser.name):
             LOGGER.warning(
                 "SKIP_PAGE text_like p=%d parser=%s sig=%s",
@@ -148,6 +171,41 @@ def run_pipeline(
                 parser.name,
                 format_page_signals(page_signals),
             )
+
+        stitch_blocks: List[dict] = []
+        if (
+            page_signals.get("cooccurrence_count", 0) == 0
+            and page_signals.get("mixed_code_count", 0) >= config.STITCHER_MIN_MIXED_CODE
+            and page_signals.get("price_like_count", 0) >= config.STITCHER_MIN_PRICE_LIKE
+            and table_likelihood >= config.STITCHER_TABLE_LIKELIHOOD_MIN
+        ):
+            stitched_rows, stitch_meta = table_stitcher.stitch_page_words(
+                words=page.words,
+                target_currency=target_currency,
+                max_rows=config.STITCHER_MAX_ROWS_PER_PAGE,
+                y_tolerance=config.STITCHER_LINE_Y_TOLERANCE,
+            )
+            if stitched_rows:
+                guardrail_counts["table_stitcher_used_pages"] += 1
+                guardrail_counts["table_stitcher_rows_built"] += stitch_meta.get(
+                    "rows_built", 0
+                )
+                for stitched in stitched_rows:
+                    notes = ["table_stitcher"]
+                    if stitched.get("ambiguous"):
+                        notes.append("table_stitcher_ambiguous")
+                    if stitched.get("windowed"):
+                        notes.append("table_stitcher_windowed")
+                    stitch_blocks.append(
+                        {
+                            "page": page.page_number,
+                            "section": current_section,
+                            "raw_text": stitched.get("line_text", ""),
+                            "ocr_used": page.ocr_used,
+                            "notes": notes,
+                            "review_only": page_review_only,
+                        }
+                    )
 
         section = parser.detect_section(lines)
         if section:
@@ -175,6 +233,8 @@ def run_pipeline(
                     "review_only": page_review_only,
                 }
             )
+        if stitch_blocks:
+            blocks.extend(stitch_blocks)
 
     LOGGER.info("Blocks detected: %d", len(blocks))
 
@@ -199,6 +259,35 @@ def run_pipeline(
             flat_line = " ".join(normalized_block.split())
             line_info = text_utils.analyze_line(flat_line)
             token_info = text_utils.resolve_row_fields(flat_line)
+            year_price_blocked = int(token_info.get("year_price_blocked", 0) or 0)
+            if year_price_blocked:
+                guardrail_counts["year_price_blocked"] += year_price_blocked
+            filtered_color_temp_code = int(
+                token_info.get("filtered_color_temp_code", 0) or 0
+            )
+            if filtered_color_temp_code:
+                guardrail_counts["filtered_color_temp_code"] += filtered_color_temp_code
+            filtered_short_grade_token = int(
+                token_info.get("filtered_short_grade_token", 0) or 0
+            )
+            if filtered_short_grade_token:
+                guardrail_counts["filtered_short_grade_token"] += filtered_short_grade_token
+            filtered_watt_code = int(token_info.get("filtered_watt_code", 0) or 0)
+            if filtered_watt_code:
+                guardrail_counts["filtered_watt_code"] += filtered_watt_code
+            filtered_socket_code = int(token_info.get("filtered_socket_code", 0) or 0)
+            if filtered_socket_code:
+                guardrail_counts["filtered_socket_code"] += filtered_socket_code
+            filtered_t_series_code = int(token_info.get("filtered_t_series_code", 0) or 0)
+            if filtered_t_series_code:
+                guardrail_counts["filtered_t_series_code"] += filtered_t_series_code
+            filtered_single_letter_code = int(
+                token_info.get("filtered_single_letter_code", 0) or 0
+            )
+            if filtered_single_letter_code:
+                guardrail_counts["filtered_single_letter_code"] += filtered_single_letter_code
+            if line_info.get("toc_year_price"):
+                guardrail_counts["toc_year_price"] += 1
             selected_art_no = token_info.get("selected_art_no") or {}
             if not row.art_no and selected_art_no:
                 art_no_value = selected_art_no.get("token") if isinstance(selected_art_no, dict) else ""
@@ -214,6 +303,8 @@ def run_pipeline(
                 row=row,
                 raw_text=flat_line,
                 line_info=line_info,
+                token_info=token_info,
+                export_policy_mode=export_policy_mode,
             )
             if discard_reason:
                 if discard_reason == "bad_id" and (
@@ -246,6 +337,8 @@ def run_pipeline(
                 combined_notes.append(merged_note)
             if token_info.get("dimension_candidates"):
                 combined_notes.append("dim_detected")
+            if line_info.get("dimension_line"):
+                combined_notes.append("dimension_line")
             if token_info.get("price_candidates"):
                 combined_notes.append("price_detected")
             if token_info.get("art_no_candidates"):
@@ -296,6 +389,9 @@ def run_pipeline(
 
             if row.art_no:
                 row.art_no = text_utils.canonicalize_art_no(row.art_no)
+            valid_art_no = text_utils.is_valid_art_no_token(
+                row.art_no or "", min_len=config.CODE_MIN_LEN
+            )
             if debug_art_no_samples > 0:
                 source_line = ""
                 for line in sub_block.splitlines():
@@ -321,6 +417,14 @@ def run_pipeline(
                 if len(cooccurrence_samples) < DISCARD_SAMPLE_LIMIT:
                     cooccurrence_samples.append(raw_snippet)
 
+            noise_reason = classify_noise_row(row, flat_line, line_info, token_info)
+            if noise_reason:
+                discard_reasons[noise_reason] += 1
+                guardrail_counts["noise_rows"] += 1
+                if len(discard_samples[noise_reason]) < DISCARD_SAMPLE_LIMIT:
+                    discard_samples[noise_reason].append(flat_line[:200])
+                continue
+
             invalid_price_note = f"invalid_price_{target_currency.lower()}"
             force_review = merged_note in {"merged_block_unsplit", "possible_merged_block"}
             if invalid_price_note in parse_notes:
@@ -338,13 +442,13 @@ def run_pipeline(
             if row_has_price(row):
                 has_any_price = True
             invalid_reasons = []
-            if not row.art_no:
+            if not valid_art_no:
                 invalid_reasons.append("invalid_chunk_missing_art_no")
             elif art_no_count > 1 and parser.name not in {"table_based", "code_price_based"}:
                 invalid_reasons.append("invalid_chunk_multiple_art_no")
-            if not has_any_price:
+            if not has_any_price and export_policy_mode != "partial_ok":
                 invalid_reasons.append("invalid_chunk_missing_price")
-            if not row.product_name_en:
+            if not row.product_name_en and export_policy_mode != "partial_ok":
                 invalid_reasons.append("invalid_chunk_missing_name")
             if not token_info.get("price_candidates") and not token_info.get("art_no_candidates"):
                 invalid_reasons.append("no_price_no_artno")
@@ -353,16 +457,26 @@ def run_pipeline(
                 row.needs_review = True
                 combined_notes.extend(invalid_reasons)
 
+            strong_signal = bool(
+                row_has_price(row)
+                or line_info.get("price_like")
+                or token_info.get("price_candidates")
+                or "table_stitcher" in combined_notes
+            )
             hard_ok, hard_reason = hard_validate_row(
                 row=row,
                 raw_text=flat_line,
                 line_info=line_info,
                 token_info=token_info,
+                export_policy_mode=export_policy_mode,
+                strong_signal=strong_signal,
             )
             if not hard_ok:
                 row.exported = False
                 row.needs_review = True
                 combined_notes.append(hard_reason)
+                if hard_reason in {"numeric_dimension_artno"}:
+                    guardrail_counts[hard_reason] += 1
                 if hard_reason in {"hard_legal", "dim_only_row", "header_like_strict"}:
                     row.confidence = min(row.confidence, 0.3)
                 LOGGER.warning(
@@ -373,6 +487,21 @@ def run_pipeline(
                     parser.name,
                     flat_line[:160],
                 )
+
+            if "table_stitcher_ambiguous" in combined_notes:
+                row.exported = False
+                row.needs_review = True
+                combined_notes.append("table_stitcher_ambiguous_pairing")
+
+            if export_policy_mode == "partial_ok" and not strong_signal:
+                row.exported = False
+                row.needs_review = True
+                combined_notes.append("partial_export_weak_signal")
+
+            if not valid_art_no:
+                combined_notes.append("missing_art_no")
+            if not row_has_price(row):
+                combined_notes.append("missing_price")
 
             if is_degraded_art_no(sub_block, row.art_no):
                 combined_notes.append("art_no_degraded")
@@ -386,6 +515,35 @@ def run_pipeline(
                 row.needs_review = True
                 row.exported = False
 
+            hard_review_reasons = {
+                "missing_art_no",
+                "missing_price",
+                "hard_art_no",
+                "hard_art_no_len",
+                "numeric_artno_ambiguous",
+                "numeric_dimension_artno",
+                "dim_only_row",
+                "header_like_strict",
+                "ambiguous_price_vs_artno",
+            }
+            soft_review_reasons = {
+                "table_stitcher_ambiguous_pairing",
+                "duplicate_variant",
+                "dimension_line",
+            }
+            hard_hits = [note for note in combined_notes if note in hard_review_reasons]
+            soft_hits = [note for note in combined_notes if note in soft_review_reasons]
+            if hard_hits:
+                row.exported = False
+                row.needs_review = True
+            elif valid_art_no and row_has_price(row):
+                row.exported = True
+                row.needs_review = False
+                if soft_hits:
+                    combined_notes.append(
+                        "SOFT_REVIEW:" + ",".join(sorted(set(soft_hits)))
+                    )
+
             row.notes = "; ".join(unique_notes(combined_notes))
             if force_review:
                 row.needs_review = True
@@ -393,15 +551,27 @@ def run_pipeline(
             if filter_currency:
                 apply_currency_filter(row, target_currency)
                 if get_price_by_currency(row, target_currency) is None:
-                    skipped_missing_target_price += 1
-                    if skipped_missing_target_price <= 5:
-                        LOGGER.info(
-                            "Skipping row missing target currency price: currency=%s art_no=%s page=%s",
-                            target_currency,
-                            row.art_no or "",
-                            row.page,
-                        )
-                    continue
+                    if not (
+                        export_policy_mode == "partial_ok"
+                        and not row_has_price(row)
+                        and strong_signal
+                    ):
+                        skipped_missing_target_price += 1
+                        if skipped_missing_target_price <= 5:
+                            LOGGER.info(
+                                "Skipping row missing target currency price: currency=%s art_no=%s page=%s",
+                                target_currency,
+                                row.art_no or "",
+                                row.page,
+                            )
+                        continue
+
+            if export_policy_mode == "partial_ok" and row.exported:
+                if not row.product_name_en or not row_has_price(row):
+                    guardrail_counts["partial_export"] += 1
+
+            if "table_stitcher" in combined_notes and row.exported:
+                guardrail_counts["table_stitcher_rows_exported"] += 1
 
             rows.append(row)
             rows_after_filters += 1
@@ -420,7 +590,7 @@ def run_pipeline(
                 )
 
     dedup_info: Dict[str, object] = {}
-    apply_duplicate_policy(rows, target_currency, dedup_info)
+    apply_duplicate_policy(rows, target_currency, dedup_info, guardrail_counts)
     ensure_review_for_missing_prices(rows, target_currency)
 
     if debug_json:
@@ -467,6 +637,22 @@ def run_pipeline(
         )
     LOGGER.info("Output saved to %s", output_xlsx)
 
+    for key in (
+        "filtered_color_temp_code",
+        "filtered_short_grade_token",
+        "filtered_watt_code",
+        "filtered_socket_code",
+        "filtered_t_series_code",
+        "filtered_single_letter_code",
+        "year_price_blocked",
+        "noise_rows",
+        "table_stitcher_used_pages",
+        "table_stitcher_rows_built",
+        "table_stitcher_rows_exported",
+        "partial_export",
+    ):
+        guardrail_counts[key] += 0
+
     return build_report(
         rows,
         page_stats,
@@ -479,6 +665,9 @@ def run_pipeline(
         discard_samples,
         dedup_info,
         cooccurrence_samples,
+        guardrail_counts,
+        page_skip_reasons,
+        export_policy_mode,
     )
 
 
@@ -494,6 +683,9 @@ def build_report(
     discard_samples: Dict[str, List[str]],
     dedup_info: Dict[str, object],
     cooccurrence_samples: List[str],
+    guardrail_counts: Counter,
+    page_skip_reasons: Counter,
+    export_policy_mode: str,
 ) -> RunReport:
     target_currency = (target_currency or config.TARGET_CURRENCY).upper()
     exported_rows = [row for row in rows if row.exported]
@@ -537,12 +729,15 @@ def build_report(
         discard_samples=discard_samples,
         duplicates_summary=dedup_info.get("duplicates_summary", []),
         cooccurrence_samples=cooccurrence_samples,
+        guardrail_counts=dict(guardrail_counts),
+        page_skip_reasons=dict(page_skip_reasons),
         config_info={
             "threshold_text_len_for_ocr": config.THRESHOLD_TEXT_LEN_FOR_OCR,
             "confidence_threshold": config.CONFIDENCE_THRESHOLD,
             "price_min": config.PRICE_MIN,
             "price_max": config.PRICE_MAX,
             "review_rate_threshold": config.REVIEW_RATE_THRESHOLD,
+            "export_policy_mode": export_policy_mode,
         },
     )
     if art_no_quality["bad_art_no_count"] > 0:
@@ -660,7 +855,7 @@ def cleanup_output_dir(output_xlsx: str, debug_json: Optional[str]) -> None:
                 LOGGER.warning("Could not remove old output file: %s", path)
 
 
-def analyze_review_reasons(rows: List[ProductRow]) -> List[tuple]:
+def analyze_review_reasons(rows: List[ProductRow], limit: int = 20) -> List[tuple]:
     counter: Counter = Counter()
     for row in rows:
         if not row.needs_review and row.exported:
@@ -672,7 +867,7 @@ def analyze_review_reasons(rows: List[ProductRow]) -> List[tuple]:
             reason = note.strip()
             if reason:
                 counter[reason] += 1
-    return counter.most_common(5)
+    return counter.most_common(limit)
 
 
 def unique_notes(notes: List[str]) -> List[str]:
@@ -694,10 +889,48 @@ def row_has_price(row: ProductRow) -> bool:
     )
 
 
+def _row_candidate_count_from_lines(lines: List[str]) -> int:
+    if not lines:
+        return 0
+    price_like_flags: List[bool] = []
+    price_candidate_flags: List[bool] = []
+    code_counts: List[int] = []
+    for line in lines:
+        if not line:
+            price_like_flags.append(False)
+            price_candidate_flags.append(False)
+            code_counts.append(0)
+            continue
+        line_info = text_utils.analyze_line(line)
+        price_like_flags.append(bool(line_info.get("price_like")))
+        price_candidate_flags.append(bool(line_info.get("candidates")))
+        code_hits = 0
+        for token in CODE_TOKEN_RE.findall(line):
+            if text_utils.is_plausible_code(token, min_len=config.CODE_MIN_LEN):
+                code_hits += 1
+        code_counts.append(code_hits)
+
+    window = max(1, int(config.CACHE_COOCCURRENCE_NEAR_WINDOW))
+    row_candidate_count = 0
+    for idx, code_hits in enumerate(code_counts):
+        if code_hits <= 0:
+            continue
+        start = max(0, idx - window)
+        end = min(len(price_like_flags) - 1, idx + window)
+        has_price_near = any(
+            price_like_flags[i] or price_candidate_flags[i]
+            for i in range(start, end + 1)
+        )
+        if has_price_near:
+            row_candidate_count += 1
+    return row_candidate_count
+
+
 def compute_page_signals(lines: List[str]) -> Dict[str, object]:
     text = " ".join(lines)
     numeric_density = _numeric_density(text)
     price_like_count = 0
+    mixed_code_count = 0
     cooccurrence_count = 0
     for line in lines:
         if not line:
@@ -706,15 +939,24 @@ def compute_page_signals(lines: List[str]) -> Dict[str, object]:
         price_like = bool(line_info.get("price_like"))
         if price_like:
             price_like_count += 1
-        if price_like and _line_has_plausible_code(line):
+        code_hits = 0
+        for token in CODE_TOKEN_RE.findall(line):
+            if text_utils.is_plausible_code(token, min_len=config.CODE_MIN_LEN):
+                code_hits += 1
+        if code_hits:
+            mixed_code_count += code_hits
+        if price_like and code_hits:
             cooccurrence_count += 1
+    row_candidate_count = _row_candidate_count_from_lines(lines)
     legal_hits = count_legal_markers(text)
     table_hint = _table_hint_from_lines(lines)
     table_columns = estimate_table_columns(lines)
     return {
         "numeric_density": numeric_density,
         "price_like_count": price_like_count,
+        "mixed_code_count": mixed_code_count,
         "cooccurrence_count": cooccurrence_count,
+        "row_candidate_count": row_candidate_count,
         "legal_hits": legal_hits,
         "table_hint": table_hint,
         "table_columns": table_columns,
@@ -725,11 +967,53 @@ def format_page_signals(signals: Dict[str, object]) -> str:
     return (
         f"density={signals.get('numeric_density', 0.0):.3f} "
         f"price_like={signals.get('price_like_count', 0)} "
+        f"mixed_code={signals.get('mixed_code_count', 0)} "
         f"cooc={signals.get('cooccurrence_count', 0)} "
+        f"row_cand={signals.get('row_candidate_count', 0)} "
         f"legal={signals.get('legal_hits', 0)} "
         f"table_hint={bool(signals.get('table_hint'))} "
         f"table_cols={signals.get('table_columns', 0)}"
     )
+
+
+def is_toc_like_page(text: str, mixed_code_count: int = 0) -> bool:
+    text = text or ""
+    if not text:
+        return False
+    pairs = text_utils.extract_toc_year_price_pairs(text)
+    year_hits = text_utils.count_year_eur_hits(text)
+    short_numbers = text_utils.count_short_numbers(text)
+    code_hits = text_utils.count_plausible_code_tokens(text)
+
+    score = len(pairs) * 2 + year_hits
+    if short_numbers >= config.TOC_PAGE_SHORT_NUMBER_MIN:
+        score += 1
+    if len(pairs) >= config.TOC_YEAR_PRICE_PAGE_MIN_MATCHES:
+        score += 1
+    if mixed_code_count <= 0 and code_hits == 0:
+        score += 2
+
+    return score >= config.TOC_PAGE_SCORE_MIN
+
+
+def is_toc_hard_page(
+    text: str,
+    mixed_code_count: int = 0,
+    row_candidate_count: int = 0,
+) -> bool:
+    text = text or ""
+    if not text:
+        return False
+    if not is_toc_like_page(text, mixed_code_count=mixed_code_count):
+        return False
+    pairs = text_utils.extract_toc_year_price_pairs(text)
+    if len(pairs) < config.TOC_YEAR_PRICE_PAGE_MIN_MATCHES:
+        return False
+    if row_candidate_count > config.TOC_HARD_ROW_CANDIDATE_MAX:
+        return False
+    if mixed_code_count > config.TOC_HARD_MIXED_CODE_MAX:
+        return False
+    return True
 
 
 def is_text_like_page(signals: Dict[str, object], parser_name: str) -> bool:
@@ -763,6 +1047,8 @@ def hard_validate_row(
     raw_text: str,
     line_info: Dict[str, object],
     token_info: Optional[Dict[str, object]] = None,
+    export_policy_mode: str = "",
+    strong_signal: bool = False,
 ) -> Tuple[bool, str]:
     if looks_like_legal_text(raw_text):
         return False, "hard_legal"
@@ -772,31 +1058,34 @@ def hard_validate_row(
         return False, "header_like_strict"
     art_no = text_utils.canonicalize_art_no(row.art_no or "")
     if not art_no:
-        return False, "hard_art_no"
-    has_alpha = bool(re.search(r"[A-Za-z]", art_no))
-    has_digit = bool(re.search(r"\d", art_no))
-    digits_only = re.sub(r"\D", "", art_no)
-    if not has_digit:
-        return False, "hard_art_no_shape"
-    if not has_alpha:
-        if token_info and token_info.get("ambiguous_numeric"):
+        return False, "missing_art_no"
+    if token_info:
+        if token_info.get("numeric_art_no_dimension"):
+            return False, "numeric_dimension_artno"
+        if token_info.get("ambiguous_numeric"):
             return False, "ambiguous_price_vs_artno"
-        if len(digits_only) < 3 or len(digits_only) > 10:
-            return False, "hard_art_no_len"
-    if has_alpha and (len(art_no) < 4 or len(art_no) > 24):
-        return False, "hard_art_no_len"
+        if token_info.get("numeric_art_no_ambiguous"):
+            return False, "numeric_artno_ambiguous"
+    if art_no.isdigit() and (
+        line_info.get("dimension_line") or (token_info and token_info.get("dimension_candidates"))
+    ):
+        return False, "numeric_dimension_artno"
+    if not text_utils.is_valid_art_no_token(art_no, min_len=config.CODE_MIN_LEN):
+        return False, "hard_art_no"
 
-    if not row_has_price(row):
+    mode = (export_policy_mode or config.EXPORT_POLICY_MODE or "strict").lower()
+    if not row_has_price(row) and mode != "partial_ok" and not strong_signal:
         return False, "hard_no_price"
 
     name = (row.product_name_en or "").strip()
-    if not name:
-        return False, "hard_no_name"
-    if len(name) < 3 or len(name) > 90:
-        return False, "hard_name_len"
-    alpha_count = sum(1 for char in name if char.isalpha())
-    if alpha_count < 3:
-        return False, "hard_name_alpha"
+    if mode != "partial_ok":
+        if not name:
+            return False, "hard_no_name"
+        if len(name) < 3 or len(name) > 90:
+            return False, "hard_name_len"
+        alpha_count = sum(1 for char in name if char.isalpha())
+        if alpha_count < 3:
+            return False, "hard_name_alpha"
 
     return True, ""
 
@@ -854,6 +1143,41 @@ def is_header_like_strict(raw_text: str) -> bool:
     return False
 
 
+def classify_noise_row(
+    row: ProductRow,
+    raw_text: str,
+    line_info: Dict[str, object],
+    token_info: Dict[str, object],
+) -> str:
+    if not raw_text:
+        return ""
+    valid_art_no = text_utils.is_valid_art_no_token(
+        row.art_no or "", min_len=config.CODE_MIN_LEN
+    )
+    price_like = bool(line_info.get("price_like")) or bool(
+        token_info.get("price_candidates")
+    ) or row_has_price(row)
+    tokens = text_utils.tokenize_line(raw_text)
+    alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]", token))
+    alpha_chars = sum(1 for char in raw_text if char.isalpha())
+
+    if not valid_art_no and line_info.get("toc_year_price"):
+        return "noise_toc_line"
+    if not valid_art_no and text_utils.is_toc_like_line(raw_text):
+        return "noise_toc_line"
+    if not valid_art_no and is_header_like_strict(raw_text):
+        return "noise_header"
+    if not valid_art_no and (token_info.get("dimension_candidates") or line_info.get("dimension_line")):
+        if not price_like:
+            return "noise_dimension_block"
+    if not valid_art_no and price_like:
+        if alpha_tokens < 2 or alpha_chars < 4:
+            return "noise_price_only"
+        if len(tokens) <= 2 and line_info.get("has_currency"):
+            return "noise_price_only"
+    return ""
+
+
 def _line_has_plausible_code(line: str) -> bool:
     for token in CODE_TOKEN_RE.findall(line or ""):
         if text_utils.is_plausible_code(token, min_len=config.CODE_MIN_LEN):
@@ -901,17 +1225,37 @@ def estimate_table_columns(lines: List[str]) -> int:
     return max_columns
 
 
-def primary_discard_reason(parser, row: ProductRow, raw_text: str, line_info: Dict[str, object]) -> str:
-    if not row.art_no:
-        return "bad_id"
+def primary_discard_reason(
+    parser,
+    row: ProductRow,
+    raw_text: str,
+    line_info: Dict[str, object],
+    token_info: Optional[Dict[str, object]] = None,
+    export_policy_mode: str = "",
+) -> str:
+    mode = (export_policy_mode or config.EXPORT_POLICY_MODE or "strict").lower()
     header_like_fn = getattr(parser, "_is_header_like", None)
     if header_like_fn and header_like_fn(raw_text):
         return "header_like"
+    if line_info.get("toc_year_price"):
+        return "toc_year_price"
+    if not row.art_no:
+        if token_info and token_info.get("art_no_candidates") and mode == "partial_ok":
+            return ""
+        return "bad_id"
     if line_info.get("dimension_line") and not line_info.get("price_like"):
         return "dimension_line"
-    if parser.name == "code_price_based" and not line_info.get("price_like"):
+    if (
+        mode != "partial_ok"
+        and parser.name == "code_price_based"
+        and not line_info.get("price_like")
+    ):
         return "no_price"
-    if not line_info.get("price_like") and not row_has_price(row):
+    if (
+        mode != "partial_ok"
+        and not line_info.get("price_like")
+        and not row_has_price(row)
+    ):
         return "no_price"
     return ""
 
@@ -920,9 +1264,7 @@ def canonical_art_no_key(value: str, raw_text: str = "") -> str:
     key = text_utils.canonicalize_art_no(value or "")
     if not key:
         return ""
-    if not re.search(r"\d", key):
-        return ""
-    if key.isdigit() and len(key) >= 6 and raw_text and ART_NO_LINE_RE.search(raw_text):
+    if not text_utils.is_valid_art_no_token(key, min_len=config.CODE_MIN_LEN):
         return ""
     return key
 
@@ -966,7 +1308,10 @@ def ensure_review_for_missing_prices(rows: List[ProductRow], currency: str) -> N
 
 
 def apply_duplicate_policy(
-    rows: List[ProductRow], currency: str, dedup_info: Optional[Dict[str, object]] = None
+    rows: List[ProductRow],
+    currency: str,
+    dedup_info: Optional[Dict[str, object]] = None,
+    guardrail_counts: Optional[Counter] = None,
 ) -> None:
     currency = currency.upper()
     grouped = defaultdict(list)
@@ -1009,12 +1354,22 @@ def apply_duplicate_policy(
             if line_info.get("dimension_line") and not price_like:
                 reason = "technical_sheet_line"
                 row.needs_review = False
+                row.exported = False
+                row.noise = True
+                if guardrail_counts is not None:
+                    guardrail_counts["noise_rows"] += 1
             elif not price_like:
                 reason = "technical_sheet_line"
                 row.needs_review = False
+                row.exported = False
+                row.noise = True
+                if guardrail_counts is not None:
+                    guardrail_counts["noise_rows"] += 1
             else:
                 reason = "duplicate_variant"
-            row.exported = False
+                row.exported = True
+                row.needs_review = False
+                add_row_note(row, "SOFT_REVIEW:duplicate_variant")
             add_row_note(row, reason)
             variant_reasons[reason] += 1
             if len(variant_samples) < 3:
