@@ -6,6 +6,7 @@ from typing import Callable, List, Optional, Tuple
 
 from pdf2xlsx import config
 from pdf2xlsx.core import normalize, page_cache, pipeline, scoring, triage
+from pdf2xlsx.io import xlsx_writer
 from pdf2xlsx.io.run_debug import RunDebugCollector
 from pdf2xlsx.models import TriageResult
 from pdf2xlsx.parsers import get_parser
@@ -26,6 +27,15 @@ CURRENCY_PRICE_RE = re.compile(
     r"\b(EUR|DKK|SEK|NOK)\s+([0-9]+(?:[.,][0-9]{1,2})?)",
     re.IGNORECASE,
 )
+RETRY_REASONS = {
+    "too_few_rows",
+    "no_valid_rows_found",
+    "low_unique_code_ratio",
+    "low_key_fields_rate",
+    "table_precheck_failed",
+    "early_discard_low_unique",
+    "early_discard_low_key_fields",
+}
 
 
 def detect_target_currency(cached_pages, fallback: str) -> Tuple[str, float, dict, bool]:
@@ -44,6 +54,111 @@ def detect_target_currency(cached_pages, fallback: str) -> Tuple[str, float, dic
     if total < config.CURRENCY_AUTO_MIN_COUNT or ratio < config.CURRENCY_AUTO_MIN_RATIO:
         return fallback, ratio, counts, multi_currency
     return best, ratio, counts, multi_currency
+
+
+def resolve_target_currency(
+    cached_pages,
+    fallback_currency: str,
+    explicit_currency: str,
+) -> Tuple[str, float, dict, bool]:
+    explicit = (explicit_currency or "").upper()
+    fallback = (fallback_currency or config.TARGET_CURRENCY).upper()
+    if explicit in CURRENCY_CODES:
+        return explicit, 1.0, {}, True
+    detected_currency, currency_confidence, currency_counts, multi_currency = (
+        detect_target_currency(cached_pages, fallback)
+    )
+    if multi_currency and "EUR" in currency_counts and currency_counts["EUR"] > 0:
+        target_currency = "EUR"
+    else:
+        target_currency = detected_currency
+    filter_currency = multi_currency
+    return target_currency, currency_confidence, currency_counts, filter_currency
+
+
+def should_retry_fast_eval(attempt_results: List[dict]) -> str:
+    for result in attempt_results:
+        reason = result.get("reason")
+        if reason in RETRY_REASONS:
+            return reason
+    return ""
+
+
+def write_diagnostic_output(
+    output_dir: Path,
+    stem: str,
+    source_file: str,
+    cached_pages: List[page_cache.CachedPage],
+    cache_meta: dict,
+    attempt_results: List[dict],
+) -> str:
+    diagnostic_path = output_dir / f"{stem}.diagnostic.xlsx"
+    xlsx_writer.write_diagnostic_summary(
+        output_path=str(diagnostic_path),
+        source_file=source_file,
+        cached_pages=cached_pages,
+        cache_meta=cache_meta or {},
+        attempt_results=attempt_results or [],
+    )
+    LOGGER.info("DIAGNOSTIC_OUTPUT written=%s", diagnostic_path)
+    return str(diagnostic_path)
+
+
+def run_fast_eval_profiles(
+    cached_pages: List[page_cache.CachedPage],
+    triage_result: TriageResult,
+    target_currency: str,
+    filter_currency: bool,
+    source_file: str,
+) -> Tuple[List[str], List[dict], List[dict]]:
+    attempts: List[str] = []
+    attempts_detail: List[dict] = []
+    attempt_results: List[dict] = []
+    ordered_profiles = order_profiles(triage_result)
+    for profile_id in ordered_profiles:
+        parser_name = PROFILE_PARSER_MAP.get(profile_id, "")
+        if not parser_name:
+            attempts.append(f"{profile_id}:fail(missing_parser)")
+            attempt_results.append(
+                {"parser": parser_name, "ok": False, "reason": "missing_parser"}
+            )
+            continue
+
+        eval_result = evaluate_parser_fast(
+            cached_pages=cached_pages,
+            parser_name=parser_name,
+            source_file=source_file,
+            currency=target_currency,
+            currency_only=target_currency if filter_currency else "",
+            triage_result=triage_result,
+        )
+        attempt_results.append(eval_result)
+        attempts_detail.append(
+            {
+                "source_file": source_file,
+                "parser": parser_name,
+                "eval_pages": eval_result.get("metrics", {}).get("eval_pages_used", 0),
+                "eval_rows": eval_result.get("metrics", {}).get("eval_rows", 0),
+                "eval_time_ms": eval_result.get("metrics", {}).get("eval_time_ms", 0),
+                "eval_score": eval_result.get("metrics", {}).get("eval_score", 0.0),
+                "status": "ok" if eval_result.get("ok") else "fail",
+                "fail_reason": "" if eval_result.get("ok") else eval_result.get("reason", ""),
+            }
+        )
+        attempts.append(
+            format_attempt(
+                parser_name,
+                "ok" if eval_result.get("ok") else "fail",
+                eval_result.get("reason", ""),
+                eval_result.get("metrics", {}),
+                eval_result.get("score"),
+            )
+        )
+
+        if eval_result.get("ok") and is_excellent(eval_result.get("metrics", {})):
+            break
+
+    return attempts, attempts_detail, attempt_results
 
 
 def run_auto_folder(
@@ -120,10 +235,11 @@ def run_auto_for_pdf(
     code_patterns = label_utils.build_label_patterns(code_dict.get("fields", {}))
     stopwords = label_dict.get("stopwords") or config.TRIAGE_STOPWORDS
 
-    if cached_pages is None or triage_result is None:
-        cached_pages, page_notes = page_cache.build_signal_cache(
+    provided_cache = cached_pages is not None and triage_result is not None
+    if not provided_cache:
+        cached_pages, page_notes, cache_meta = page_cache.build_signal_cache(
             pdf_path,
-            max_pages=config.TRIAGE_SAMPLE_PAGES_MAX,
+            max_pages=config.TRIAGE_TOP_K_MAX,
             min_text_len=config.TRIAGE_TEXT_LEN_MIN,
             stopwords=stopwords,
             ocr=ocr,
@@ -137,24 +253,22 @@ def run_auto_for_pdf(
         )
     else:
         page_notes = []
+        cache_meta = {}
+
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    stem = Path(pdf_path).stem
 
     fallback_currency = (currency or config.TARGET_CURRENCY).upper()
     explicit_currency = (currency_only or "").upper()
-    filter_currency = False
-    if explicit_currency in CURRENCY_CODES:
-        target_currency = explicit_currency
-        currency_confidence = 1.0
-        currency_counts = {}
-        filter_currency = True
-    else:
-        detected_currency, currency_confidence, currency_counts, multi_currency = (
-            detect_target_currency(cached_pages, fallback_currency)
+    target_currency, currency_confidence, currency_counts, filter_currency = (
+        resolve_target_currency(
+            cached_pages=cached_pages,
+            fallback_currency=fallback_currency,
+            explicit_currency=explicit_currency,
         )
-        if multi_currency and "EUR" in currency_counts and currency_counts["EUR"] > 0:
-            target_currency = "EUR"
-        else:
-            target_currency = detected_currency
-        filter_currency = multi_currency
+    )
+    if explicit_currency not in CURRENCY_CODES:
         LOGGER.info(
             "Auto target currency: %s (confidence=%.2f counts=%s)",
             target_currency,
@@ -165,56 +279,107 @@ def run_auto_for_pdf(
     triage_result.currency_confidence = currency_confidence
     triage_result.currency_counts = currency_counts
 
-    attempts = []
-    attempts_detail: List[dict] = []
-    attempt_results: List[dict] = []
-    ordered_profiles = order_profiles(triage_result)
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-    stem = Path(pdf_path).stem
+    attempts, attempts_detail, attempt_results = run_fast_eval_profiles(
+        cached_pages=cached_pages,
+        triage_result=triage_result,
+        target_currency=target_currency,
+        filter_currency=filter_currency,
+        source_file=Path(pdf_path).name,
+    )
+    selected = select_best_run(attempt_results)
 
-    for profile_id in ordered_profiles:
-        parser_name = PROFILE_PARSER_MAP.get(profile_id, "")
-        if not parser_name:
-            attempts.append(f"{profile_id}:fail(missing_parser)")
-            attempt_results.append(
-                {"parser": parser_name, "ok": False, "reason": "missing_parser"}
-            )
-            continue
-
-        eval_result = evaluate_parser_fast(
+    retry_reason = should_retry_fast_eval(attempt_results)
+    if not provided_cache and retry_reason:
+        old_sample = cache_meta.get("sample_count", len(cached_pages))
+        cached_pages, page_notes, cache_meta = page_cache.build_signal_cache(
+            pdf_path,
+            max_pages=config.TRIAGE_TOP_K_MAX,
+            min_text_len=config.TRIAGE_TEXT_LEN_MIN,
+            stopwords=stopwords,
+            ocr=ocr,
+            sample_multiplier=config.CACHE_SAMPLE_RETRY_MULTIPLIER,
+            scan_mode="retry",
+            force_rescan=True,
+        )
+        LOGGER.info(
+            "RETRY_SCAN reason=%s old=%s new=%s",
+            retry_reason,
+            old_sample,
+            cache_meta.get("sample_count", len(cached_pages)),
+        )
+        triage_result = triage.scan_cached_pages(
+            pdf_path=pdf_path,
             cached_pages=cached_pages,
-            parser_name=parser_name,
-            source_file=Path(pdf_path).name,
-            currency=target_currency,
-            currency_only=target_currency if filter_currency else "",
-            triage_result=triage_result,
+            page_notes=page_notes,
+            marker_patterns=marker_patterns,
+            code_patterns=code_patterns,
         )
-        attempt_results.append(eval_result)
-        attempts_detail.append(
-            {
-                "source_file": Path(pdf_path).name,
-                "parser": parser_name,
-                "eval_pages": eval_result.get("metrics", {}).get("eval_pages_used", 0),
-                "eval_rows": eval_result.get("metrics", {}).get("eval_rows", 0),
-                "eval_time_ms": eval_result.get("metrics", {}).get("eval_time_ms", 0),
-                "eval_score": eval_result.get("metrics", {}).get("eval_score", 0.0),
-                "status": "ok" if eval_result.get("ok") else "fail",
-                "fail_reason": "" if eval_result.get("ok") else eval_result.get("reason", ""),
-            }
-        )
-        attempts.append(
-            format_attempt(
-                parser_name,
-                "ok" if eval_result.get("ok") else "fail",
-                eval_result.get("reason", ""),
-                eval_result.get("metrics", {}),
-                eval_result.get("score"),
+        target_currency, currency_confidence, currency_counts, filter_currency = (
+            resolve_target_currency(
+                cached_pages=cached_pages,
+                fallback_currency=fallback_currency,
+                explicit_currency=explicit_currency,
             )
         )
+        triage_result.target_currency = target_currency
+        triage_result.currency_confidence = currency_confidence
+        triage_result.currency_counts = currency_counts
+        attempts, attempts_detail, attempt_results = run_fast_eval_profiles(
+            cached_pages=cached_pages,
+            triage_result=triage_result,
+            target_currency=target_currency,
+            filter_currency=filter_currency,
+            source_file=Path(pdf_path).name,
+        )
+        selected = select_best_run(attempt_results)
 
-        if eval_result.get("ok") and is_excellent(eval_result.get("metrics", {})):
-            break
+    if (
+        not provided_cache
+        and not selected
+        and config.CACHE_ENABLE_SWEEP_AFTER_RETRY
+    ):
+        old_sample = cache_meta.get("sample_count", len(cached_pages))
+        cached_pages, page_notes, cache_meta = page_cache.build_signal_cache(
+            pdf_path,
+            max_pages=config.TRIAGE_TOP_K_MAX,
+            min_text_len=config.TRIAGE_TEXT_LEN_MIN,
+            stopwords=stopwords,
+            ocr=ocr,
+            sample_multiplier=config.CACHE_SAMPLE_SWEEP_MULTIPLIER,
+            scan_mode="sweep",
+            force_rescan=True,
+            enable_ocr=True,
+        )
+        LOGGER.info(
+            "RETRY_SCAN reason=sweep old=%s new=%s",
+            old_sample,
+            cache_meta.get("sample_count", len(cached_pages)),
+        )
+        triage_result = triage.scan_cached_pages(
+            pdf_path=pdf_path,
+            cached_pages=cached_pages,
+            page_notes=page_notes,
+            marker_patterns=marker_patterns,
+            code_patterns=code_patterns,
+        )
+        target_currency, currency_confidence, currency_counts, filter_currency = (
+            resolve_target_currency(
+                cached_pages=cached_pages,
+                fallback_currency=fallback_currency,
+                explicit_currency=explicit_currency,
+            )
+        )
+        triage_result.target_currency = target_currency
+        triage_result.currency_confidence = currency_confidence
+        triage_result.currency_counts = currency_counts
+        attempts, attempts_detail, attempt_results = run_fast_eval_profiles(
+            cached_pages=cached_pages,
+            triage_result=triage_result,
+            target_currency=target_currency,
+            filter_currency=filter_currency,
+            source_file=Path(pdf_path).name,
+        )
+        selected = select_best_run(attempt_results)
 
     triage_result.eval_time_ms_total = int((time.monotonic() - eval_start) * 1000)
     triage_result.attempts_detail = attempts_detail
@@ -239,6 +404,14 @@ def run_auto_for_pdf(
             triage_result.failure_reason = extract_last_failure(attempts[-1])
         else:
             triage_result.failure_reason = "no_parsers_available"
+        triage_result.output_path = write_diagnostic_output(
+            output_dir=output_dir_path,
+            stem=stem,
+            source_file=Path(pdf_path).name,
+            cached_pages=cached_pages,
+            cache_meta=cache_meta,
+            attempt_results=attempt_results,
+        )
         if run_debug:
             run_debug.add_pdf(
                 pdf_path,
@@ -332,6 +505,14 @@ def run_auto_for_pdf(
                 attempt_xlsx.unlink()
             except OSError:
                 LOGGER.warning("Could not remove failed output %s", attempt_xlsx)
+        triage_result.output_path = write_diagnostic_output(
+            output_dir=output_dir_path,
+            stem=stem,
+            source_file=Path(pdf_path).name,
+            cached_pages=cached_pages,
+            cache_meta=cache_meta,
+            attempt_results=attempt_results,
+        )
         if run_debug:
             run_debug.add_pdf(
                 pdf_path,
@@ -640,6 +821,17 @@ def evaluate_parser_fast(
                 normalized_block = normalize.normalize_text(sub_block)
                 flat_line = " ".join(normalized_block.split())
                 line_info = text_utils.analyze_line(flat_line)
+                token_info = text_utils.resolve_row_fields(flat_line)
+                selected_art_no = token_info.get("selected_art_no") or {}
+                if not row.art_no and selected_art_no:
+                    art_no_value = selected_art_no.get("token") if isinstance(selected_art_no, dict) else ""
+                    if art_no_value and not token_info.get("ambiguous_numeric"):
+                        row.art_no = art_no_value
+                        row.art_no_raw = art_no_value
+                if not row.product_name_en and token_info.get("name"):
+                    row.product_name_en = token_info.get("name") or ""
+                if not row.size_raw and token_info.get("dimension_candidates"):
+                    row.size_raw = " | ".join(token_info.get("dimension_candidates") or [])
                 discard_reason = pipeline.primary_discard_reason(
                     parser=parser,
                     row=row,
@@ -647,7 +839,14 @@ def evaluate_parser_fast(
                     line_info=line_info,
                 )
                 if discard_reason:
-                    continue
+                    if discard_reason == "bad_id" and (
+                        token_info.get("ambiguous_numeric")
+                        or token_info.get("art_no_candidates")
+                        or token_info.get("price_candidates")
+                    ):
+                        discard_reason = ""
+                    if discard_reason:
+                        continue
                 confidence, needs_review, notes = scoring.score_row(
                     row=row,
                     size_unparsed=size_unparsed,
@@ -661,6 +860,16 @@ def evaluate_parser_fast(
                 combined_notes = parse_notes + notes + block.get("notes", [])
                 if merged_note:
                     combined_notes.append(merged_note)
+                if token_info.get("dimension_candidates"):
+                    combined_notes.append("dim_detected")
+                if token_info.get("price_candidates"):
+                    combined_notes.append("price_detected")
+                if token_info.get("art_no_candidates"):
+                    combined_notes.append("artno_detected")
+                if token_info.get("ambiguous_numeric"):
+                    row.exported = False
+                    row.needs_review = True
+                    combined_notes.append("ambiguous_price_vs_artno")
 
                 if row.art_no:
                     row.art_no = text_utils.canonicalize_art_no(row.art_no)
@@ -694,10 +903,23 @@ def evaluate_parser_fast(
                     invalid_reasons.append("invalid_chunk_missing_price")
                 if not row.product_name_en:
                     invalid_reasons.append("invalid_chunk_missing_name")
+                if not token_info.get("price_candidates") and not token_info.get("art_no_candidates"):
+                    invalid_reasons.append("no_price_no_artno")
                 if invalid_reasons:
                     row.exported = False
                     row.needs_review = True
                     combined_notes.extend(invalid_reasons)
+
+                hard_ok, hard_reason = pipeline.hard_validate_row(
+                    row=row,
+                    raw_text=flat_line,
+                    line_info=line_info,
+                    token_info=token_info,
+                )
+                if not hard_ok:
+                    row.exported = False
+                    row.needs_review = True
+                    combined_notes.append(hard_reason)
 
                 if pipeline.is_degraded_art_no(sub_block, row.art_no):
                     combined_notes.append("art_no_degraded")

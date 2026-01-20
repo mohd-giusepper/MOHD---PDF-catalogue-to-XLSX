@@ -19,6 +19,36 @@ _NUMBER_TOKEN_RE = re.compile(
 )
 _THOUSANDS_RE = re.compile(r"^\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?$")
 _DECIMAL_2_RE = re.compile(r"[.,]\d{2}$")
+_PRICE_TOKEN_RE = re.compile(
+    r"^(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d{1,7}(?:[.,]\d{1,2})?)$"
+)
+_TOKEN_STRIP_CHARS = " ,;:()[]{}<>|"
+_CURRENCY_TOKENS = {
+    "EUR",
+    "DKK",
+    "SEK",
+    "NOK",
+    "USD",
+    "GBP",
+    "CHF",
+    "JPY",
+    "CAD",
+    "AUD",
+}
+_DIMENSION_X_RE = re.compile(
+    r"^\d+(?:[.,]\d+)?(?:x\d+(?:[.,]\d+)?){1,2}(?:cm|mm|m)?$",
+    re.IGNORECASE,
+)
+_DIMENSION_LABEL_RE = re.compile(
+    r"^(?:H|W|D|L|O)\s*\d+(?:[.,]\d+)?(?:\s*(?:cm|mm|m))?$",
+    re.IGNORECASE,
+)
+_DIMENSION_LABEL_PREFIX_RE = re.compile(
+    r"^(?:H|W|D|L|O)\d+(?:[.,]\d+)?(?:cm|mm|m)?$",
+    re.IGNORECASE,
+)
+_X_TOKENS = {"x", "X", "\u00d7"}
+_UNIT_TOKENS = {"cm", "mm", "m", "mq", "sqm", "m2"}
 
 
 def is_dimension_token(token: str) -> bool:
@@ -68,6 +98,274 @@ def is_plausible_code(token: str, min_len: int = 5) -> bool:
     if re.search(r"(.)\1\1", cleaned):
         return False
     return True
+
+
+def tokenize_line(line: str) -> List[str]:
+    if not line:
+        return []
+    normalized = line.replace("\u20ac", " \u20ac ")
+    parts = re.split(r"\s+", normalized.strip())
+    tokens: List[str] = []
+    for part in parts:
+        cleaned = part.strip(_TOKEN_STRIP_CHARS)
+        if cleaned:
+            tokens.append(cleaned)
+    return tokens
+
+
+def classify_token(token: str) -> str:
+    if not token:
+        return "TEXT"
+    if is_dimension_candidate_token(token):
+        return "DIM_CANDIDATE"
+    if is_currency_token(token):
+        return "PRICE_CANDIDATE"
+    cleaned = strip_currency_token(token)
+    if _PRICE_TOKEN_RE.match(cleaned) and parse_price(cleaned) is not None:
+        return "PRICE_CANDIDATE"
+    if is_art_no_candidate_token(token):
+        return "ARTNO_CANDIDATE"
+    return "TEXT"
+
+
+def resolve_row_fields(line: str) -> Dict[str, object]:
+    """Extract candidates and selections; set ambiguous_numeric when numeric art_no vs price is unclear."""
+    tokens = tokenize_line(line)
+    consumed = set()
+    dimension_candidates: List[str] = []
+
+    for idx, token in enumerate(tokens):
+        if is_dimension_candidate_token(token):
+            dimension_candidates.append(token)
+            consumed.add(idx)
+
+    idx = 0
+    while idx < len(tokens):
+        if idx in consumed:
+            idx += 1
+            continue
+        token = tokens[idx]
+        if is_number_token(token) and idx + 2 < len(tokens):
+            sep = tokens[idx + 1]
+            tail = tokens[idx + 2]
+            if sep in _X_TOKENS and is_number_token(tail):
+                span_tokens = [token, sep, tail]
+                end = idx + 3
+                if end + 1 < len(tokens) and tokens[end] in _X_TOKENS and is_number_token(tokens[end + 1]):
+                    span_tokens.extend([tokens[end], tokens[end + 1]])
+                    end += 2
+                if end < len(tokens) and is_unit_token(tokens[end]):
+                    span_tokens.append(tokens[end])
+                    end += 1
+                dimension_candidates.append(" ".join(span_tokens))
+                consumed.update(range(idx, end))
+                idx = end
+                continue
+        if is_dimension_label_token(token) and idx + 1 < len(tokens) and is_number_token(tokens[idx + 1]):
+            span_tokens = [token, tokens[idx + 1]]
+            end = idx + 2
+            if end < len(tokens) and is_unit_token(tokens[end]):
+                span_tokens.append(tokens[end])
+                end += 1
+            dimension_candidates.append(" ".join(span_tokens))
+            consumed.update(range(idx, end))
+            idx = end
+            continue
+        idx += 1
+
+    currency_indices = {i for i, token in enumerate(tokens) if is_currency_token(token)}
+    price_candidates: List[Dict[str, object]] = []
+    for idx, token in enumerate(tokens):
+        if idx in consumed:
+            continue
+        cleaned = strip_currency_token(token)
+        if not _PRICE_TOKEN_RE.match(cleaned):
+            continue
+        value = parse_price(cleaned)
+        if value is None:
+            continue
+        has_currency = (
+            idx in currency_indices
+            or (idx - 1) in currency_indices
+            or (idx + 1) in currency_indices
+            or token_has_currency(token)
+        )
+        score = 0
+        if has_currency:
+            score += 3
+        if _THOUSANDS_RE.match(cleaned):
+            score += 2
+        if _DECIMAL_2_RE.search(cleaned):
+            score += 1
+        if value >= 100:
+            score += 1
+        price_candidates.append(
+            {
+                "token": cleaned,
+                "value": value,
+                "score": score,
+                "idx": idx,
+                "has_currency": has_currency,
+            }
+        )
+
+    art_no_candidates: List[Dict[str, object]] = []
+    for idx, token in enumerate(tokens):
+        if idx in consumed:
+            continue
+        if is_currency_token(token):
+            continue
+        candidate = canonicalize_art_no(token)
+        if not candidate:
+            continue
+        if re.search(r"[A-Za-z]", candidate) and re.search(r"\d", candidate):
+            art_no_candidates.append(
+                {
+                    "token": candidate,
+                    "score": 3,
+                    "idx": idx,
+                    "kind": "alnum",
+                }
+            )
+            continue
+        digits_only = re.sub(r"\D", "", candidate)
+        numeric_like = candidate.isdigit() or bool(re.fullmatch(r"\d+(?:[-./]\d+)+", candidate))
+        if numeric_like:
+            if idx in currency_indices or (idx - 1) in currency_indices or (idx + 1) in currency_indices:
+                continue
+            if _THOUSANDS_RE.match(token) or _DECIMAL_2_RE.search(token):
+                continue
+            if 3 <= len(digits_only) <= 6:
+                score = 2
+            elif 7 <= len(digits_only) <= 10:
+                score = 1
+            else:
+                continue
+            art_no_candidates.append(
+                {
+                    "token": candidate,
+                    "score": score,
+                    "idx": idx,
+                    "kind": "numeric",
+                }
+            )
+
+    price_candidates.sort(key=lambda item: (item["score"], item["value"]), reverse=True)
+    art_no_candidates.sort(key=lambda item: (item["score"], len(item["token"])), reverse=True)
+
+    selected_price = price_candidates[0] if price_candidates else None
+    selected_art_no = art_no_candidates[0] if art_no_candidates else None
+
+    ambiguous_numeric = False
+    if selected_art_no and selected_art_no.get("kind") == "numeric":
+        numeric_tokens = {
+            item["token"] for item in art_no_candidates if item.get("kind") == "numeric"
+        }
+        price_tokens = {item["token"] for item in price_candidates}
+        overlap = numeric_tokens & price_tokens
+        if overlap:
+            strong_alt_price = any(
+                item["score"] >= 3 and item["token"] not in overlap
+                for item in price_candidates
+            )
+            if not strong_alt_price:
+                ambiguous_numeric = True
+
+    consumed_name_indices = set(consumed)
+    if selected_price:
+        consumed_name_indices.add(int(selected_price["idx"]))
+        for adj in (int(selected_price["idx"]) - 1, int(selected_price["idx"]) + 1):
+            if 0 <= adj < len(tokens) and is_currency_token(tokens[adj]):
+                consumed_name_indices.add(adj)
+    if selected_art_no:
+        consumed_name_indices.add(int(selected_art_no["idx"]))
+
+    name_tokens = [
+        token
+        for idx, token in enumerate(tokens)
+        if idx not in consumed_name_indices and not is_currency_token(token)
+    ]
+    name = " ".join(name_tokens).strip()
+
+    return {
+        "tokens": tokens,
+        "dimension_candidates": dimension_candidates,
+        "price_candidates": price_candidates,
+        "art_no_candidates": art_no_candidates,
+        "selected_price": selected_price,
+        "selected_art_no": selected_art_no,
+        "ambiguous_numeric": ambiguous_numeric,
+        "name": name,
+    }
+
+
+def is_currency_token(token: str) -> bool:
+    if not token:
+        return False
+    if token == "\u20ac":
+        return True
+    return token.upper() in _CURRENCY_TOKENS
+
+
+def token_has_currency(token: str) -> bool:
+    if not token:
+        return False
+    if "\u20ac" in token:
+        return True
+    upper = token.upper()
+    return any(code in upper for code in _CURRENCY_TOKENS)
+
+
+def strip_currency_token(token: str) -> str:
+    if not token:
+        return ""
+    value = token.replace("\u20ac", "")
+    for code in _CURRENCY_TOKENS:
+        value = re.sub(rf"^{code}", "", value, flags=re.IGNORECASE)
+        value = re.sub(rf"{code}$", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def is_number_token(token: str) -> bool:
+    return parse_number(token) is not None
+
+
+def is_unit_token(token: str) -> bool:
+    return token.lower() in _UNIT_TOKENS
+
+
+def is_dimension_label_token(token: str) -> bool:
+    if not token:
+        return False
+    return token.upper() in {"H", "W", "D", "L", "O"}
+
+
+def is_dimension_candidate_token(token: str) -> bool:
+    if not token:
+        return False
+    normalized = token.replace("\u00d7", "x")
+    collapsed = normalized.replace(" ", "")
+    if _DIMENSION_X_RE.match(collapsed):
+        return True
+    if _DIMENSION_LABEL_RE.match(normalized):
+        return True
+    if _DIMENSION_LABEL_PREFIX_RE.match(normalized):
+        return True
+    return False
+
+
+def is_art_no_candidate_token(token: str) -> bool:
+    if not token:
+        return False
+    candidate = canonicalize_art_no(token)
+    if not candidate:
+        return False
+    if re.search(r"[A-Za-z]", candidate) and re.search(r"\d", candidate):
+        return True
+    digits_only = re.sub(r"\D", "", candidate)
+    if candidate.isdigit() or re.fullmatch(r"\d+(?:[-./]\d+)+", candidate):
+        return 3 <= len(digits_only) <= 10
+    return False
 
 
 def analyze_line(line: str) -> Dict[str, object]:

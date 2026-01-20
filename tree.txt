@@ -1,0 +1,65 @@
+Project tree (annotated)
+========================
+./
+  main.py - entry point; runs CLI if args, otherwise GUI.
+  README.md - usage notes and project overview.
+  requirements.txt - runtime dependencies.
+  Fix and Update.txt - scratch notes.
+  .gitignore - git ignore rules.
+  .git/ - git metadata.
+  .venv/ - local virtual environment (optional).
+  __pycache__/ - Python bytecode cache.
+  input/ - sample PDF inputs used for testing/conversion.
+  output/ - generated XLSX outputs and debug packs.
+  output/debug/ - run debug summaries and logs.
+  output/cache/ - triage cache files (signal cache).
+  profiles/ - label profiles and dictionaries for parsers/triage.
+    label_dictionary.json - shared labels/stopwords.
+    stelton_marker.json - marker-based profile.
+    table_based.json - table parser profile.
+    code_price_based.json - code/price parser profile.
+  tests/ - unit tests and smoke tests.
+    test_smoke.py - basic integration sanity test.
+    test_guardrails.py - guardrails for legal/dim/header filtering.
+  src/
+    pdf2xlsx/
+      __init__.py - package init.
+      config.py - global config knobs and thresholds.
+      cli.py - command line entry point.
+      logging_setup.py - logging configuration.
+      models.py - dataclasses for ProductRow, RunReport, TriageResult.
+      core/ - conversion pipeline, triage, scoring, and orchestration.
+        extract.py - PDF page extraction and optional OCR.
+        normalize.py - text normalization and line splitting.
+        pipeline.py - main parse pipeline + guards + export logic.
+        triage.py - detect parser/convertibility from sampled pages.
+        auto_convert.py - auto parser selection and conversion runner.
+        scoring.py - confidence/needs_review logic.
+        page_cache.py - cached page signals and table hints.
+        segment.py - block segmentation helpers.
+        corpus_scan.py - bulk scan and corpus metrics.
+        profile_enrich.py - build profile hints from sample pages.
+        suggestions.py - label/code/price suggestions.
+        debug_pack.py - collect debug artifacts.
+      parsers/ - parser implementations.
+        base.py - common parser interface and block splitting.
+        stelton_2025.py - marker-based parser for Stelton style PDFs.
+        table_based.py - column/table oriented parser.
+        code_price_based.py - line-based code/price parser.
+        __init__.py - parser registry and factory.
+      utils/ - shared helpers for text/labels/pages.
+        text.py - parsing helpers, tokenization, price/dim/code rules.
+        labels.py - profile label helpers.
+        pages.py - page range parsing.
+        __init__.py - utils package init.
+      io/ - I/O helpers.
+        xlsx_writer.py - write PRODUCTS/REVIEW sheets.
+        json_debug.py - debug JSON writer.
+        debug_output.py - detailed debug payloads.
+        run_debug.py - collect run debug packs.
+        triage_report.py - triage reporting.
+        corpus_report.py - corpus scan report output.
+      gui/ - GUI frontends.
+        app_pygame.py - pygame GUI.
+        app_tk.py - tkinter GUI.
+        __init__.py - GUI package init.

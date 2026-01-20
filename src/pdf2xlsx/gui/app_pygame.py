@@ -2,6 +2,7 @@ import os
 import ctypes
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -11,7 +12,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from pdf2xlsx import config
-from pdf2xlsx.core import auto_convert, triage
+from pdf2xlsx.core import auto_convert, page_cache, triage
 from pdf2xlsx.io.run_debug import RunDebugCollector
 from pdf2xlsx.logging_setup import configure_logging
 from pdf2xlsx.models import TriageResult
@@ -84,6 +85,7 @@ class App:
             self.font_heading = pygame.font.Font(None, 26)
 
         self.scan_results: List[TriageResult] = []
+        self._cached_pages_map: dict = {}
         self.status = "Seleziona file o cartella per iniziare."
         self.progress_total = 0
         self.progress_value = 0
@@ -91,6 +93,9 @@ class App:
         self._progress_ratio_display = 0.0
         self._busy_label = ""
         self._stage = ""
+        self._eta_stage = ""
+        self._eta_start = None
+        self._eta_seconds = None
         self._triage_scroll = 0
 
         self.current_folder = Path(config.INPUT_DIR).resolve()
@@ -155,6 +160,16 @@ class App:
                 primary=True,
             )
         )
+        cache_h = 26
+        cache_w = int(btn_w * 0.6)
+        cache_y = left_panel.bottom - btn_h - cache_h - 22
+        self._buttons.append(
+            Button(
+                pygame.Rect(x, cache_y, cache_w, cache_h),
+                "Cache",
+                self._clear_cache,
+            )
+        )
         stop_y = left_panel.bottom - btn_h - 16
         self._buttons.append(
             Button(
@@ -168,6 +183,16 @@ class App:
         self.stop_event.set()
         self.status = "Stop richiesto..."
         self._busy_label = "Interruzione"
+
+    def _clear_cache(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        removed = page_cache.clear_cache_dir()
+        self.status = f"Cache pulita ({removed} file)."
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("Cache", f"Cache pulita ({removed} file).")
+        root.destroy()
 
     def _set_status(self, message: str) -> None:
         self.status = message
@@ -222,6 +247,7 @@ class App:
         self._progress_ratio_display = 0.0
         self._busy_label = "Conversione"
         self._stage = "convert"
+        self._reset_eta("convert")
         self._set_status(f"Conversione {len(convert_targets)} file...")
         self._worker = threading.Thread(
             target=self._run_convert_background, args=(convert_targets,), daemon=True
@@ -239,6 +265,7 @@ class App:
             input_root=str(self.current_folder), run_type="scan"
         )
         self.scan_results = []
+        self._cached_pages_map = {}
         self._triage_scroll = 0
         self.progress_value = 0
         self.progress_total = len(targets)
@@ -246,6 +273,7 @@ class App:
         self._progress_ratio_display = 0.0
         self._busy_label = "Analisi file"
         self._stage = "scan"
+        self._reset_eta("scan")
         self._set_status(f"Caricati {len(targets)} file. Avvio analisi...")
         for idx, (path, display_name) in enumerate(targets):
             placeholder = TriageResult(
@@ -272,6 +300,7 @@ class App:
                 )
                 triage_result.source_file = display_name
                 triage_result.source_path = str(pdf_path)
+                self._cached_pages_map[str(pdf_path)] = cached_pages
             except Exception as exc:
                 triage_result = TriageResult(
                     source_file=display_name,
@@ -324,6 +353,7 @@ class App:
                 pdf_path=result.source_path,
                 output_dir=str(Path(config.OUTPUT_DIR)),
                 ocr=False,
+                cached_pages=self._cached_pages_map.get(result.source_path),
                 run_debug=self._run_debug,
                 progress_callback=page_progress,
             )
@@ -341,6 +371,39 @@ class App:
     ) -> None:
         self._queue.put(("progress", processed, total, filename, stage))
 
+    def _reset_eta(self, stage: str) -> None:
+        self._eta_stage = stage
+        self._eta_start = None
+        self._eta_seconds = None
+
+    def _update_eta(self, processed: int, total: int, stage: str) -> None:
+        if total <= 0 or processed <= 0:
+            return
+        now = time.monotonic()
+        if self._eta_stage != stage or self._eta_start is None:
+            self._eta_stage = stage
+            self._eta_start = now
+            self._eta_seconds = None
+        elapsed = max(0.0, now - self._eta_start)
+        avg = elapsed / max(1, processed)
+        remaining = max(0.0, (total - processed) * avg)
+        if self._eta_seconds is None:
+            self._eta_seconds = remaining
+        else:
+            self._eta_seconds = self._eta_seconds * 0.7 + remaining * 0.3
+
+    def _format_eta(self) -> str:
+        if self._eta_seconds is None:
+            return "--:--"
+        seconds = int(round(self._eta_seconds))
+        if seconds < 0:
+            return "--:--"
+        minutes, sec = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{sec:02d}"
+        return f"{minutes:02d}:{sec:02d}"
+
     def _poll_queue(self) -> None:
         while True:
             try:
@@ -357,6 +420,9 @@ class App:
                     self._progress_ratio_target = processed / max(1, total)
                 else:
                     self._progress_ratio_target = 0.0
+                if processed == 0:
+                    self._reset_eta(stage)
+                self._update_eta(processed, total, stage)
                 if stage == "convert":
                     self.status = f"Conversione {filename} ({processed}/{total})"
                 else:
@@ -379,6 +445,9 @@ class App:
                     self._progress_ratio_target = processed / max(1, total_selected)
                 else:
                     self._progress_ratio_target = 0.0
+                if processed == 0:
+                    self._reset_eta("convert_page")
+                self._update_eta(processed, total_selected, "convert_page")
                 self.status = (
                     f"Conversione {filename} pagina {processed}/{total_selected} "
                     f"(file {file_idx}/{file_total})"
@@ -393,6 +462,7 @@ class App:
                     self.scan_results = results
                 self._busy_label = ""
                 self._stage = ""
+                self._reset_eta("")
                 self.status = "Analisi interrotta." if partial else "Analisi completata."
                 self._write_summary_async()
             elif kind == "convert_result":
@@ -408,6 +478,7 @@ class App:
                 )
                 self._busy_label = ""
                 self._stage = ""
+                self._reset_eta("")
                 self._write_summary_async()
             elif kind == "error":
                 message = item[1]
@@ -533,7 +604,7 @@ class App:
                     button.on_click()
 
             # Debug toggle
-            debug_rect = pygame.Rect(left_panel.x + 16, left_panel.bottom - 88, 18, 18)
+            debug_rect = pygame.Rect(left_panel.x + 16, left_panel.bottom - 122, 18, 18)
             pygame.draw.rect(self.screen, CARD, debug_rect, border_radius=3)
             pygame.draw.rect(self.screen, BORDER, debug_rect, 1, border_radius=3)
             if self.debug_enabled:
@@ -673,6 +744,13 @@ class App:
                 self._draw_text(
                     progress_label,
                     (bar_rect.x - 40, bar_rect.y - 2),
+                    MUTED,
+                    self.font_small,
+                )
+                eta_label = f"ETA {self._format_eta()}"
+                self._draw_text(
+                    eta_label,
+                    (bar_rect.right + 8, bar_rect.y - 2),
                     MUTED,
                     self.font_small,
                 )

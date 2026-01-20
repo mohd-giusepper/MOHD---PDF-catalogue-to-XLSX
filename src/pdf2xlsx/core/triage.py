@@ -114,9 +114,9 @@ def scan_pdf_cached(
     code_patterns = label_utils.build_label_patterns(code_dict.get("fields", {}))
     stopwords = label_dict.get("stopwords") or config.TRIAGE_STOPWORDS
 
-    cached_pages, page_notes = page_cache.build_signal_cache(
+    cached_pages, page_notes, _ = page_cache.build_signal_cache(
         pdf_path,
-        max_pages=config.TRIAGE_SAMPLE_PAGES_MAX,
+        max_pages=config.TRIAGE_TOP_K_MAX,
         min_text_len=config.TRIAGE_TEXT_LEN_MIN,
         stopwords=stopwords,
         ocr=ocr,

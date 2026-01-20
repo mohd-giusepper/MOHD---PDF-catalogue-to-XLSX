@@ -160,9 +160,9 @@ def scan_corpus(
 
     for pdf_path in pdf_paths:
         page_count = get_page_count(pdf_path)
-        cached_pages, page_notes = page_cache.build_signal_cache(
+        cached_pages, page_notes, _ = page_cache.build_signal_cache(
             pdf_path,
-            max_pages=config.TRIAGE_SAMPLE_PAGES_MAX,
+            max_pages=config.TRIAGE_TOP_K_MAX,
             min_text_len=config.TRIAGE_TEXT_LEN_MIN,
             stopwords=stopwords,
             ocr=False,

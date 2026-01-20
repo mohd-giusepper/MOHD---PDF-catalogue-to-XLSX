@@ -1,13 +1,14 @@
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import List, Optional, Tuple
 
 from pdf2xlsx import config
-from pdf2xlsx.core import auto_convert, triage
+from pdf2xlsx.core import auto_convert, page_cache, triage
 from pdf2xlsx.io.run_debug import RunDebugCollector
 from pdf2xlsx.logging_setup import configure_logging
 from pdf2xlsx.models import TriageResult
@@ -30,9 +31,14 @@ class App:
         self._progress_target = 0
         self._progress_value = 0
         self._progress_animating = False
+        self._cached_pages_map: dict = {}
+        self._eta_stage = ""
+        self._eta_start = None
+        self._eta_seconds = None
 
         self.debug_var = tk.BooleanVar(value=config.DEBUG_JSON_DEFAULT)
         self.status_var = tk.StringVar(value="Seleziona file o cartella per iniziare.")
+        self.eta_var = tk.StringVar(value="ETA --:--")
         self._run_debug: Optional[RunDebugCollector] = None
 
         self._setup_style()
@@ -122,6 +128,10 @@ class App:
         ttk.Checkbutton(
             actions, text="Debug", variable=self.debug_var
         ).pack(anchor="w")
+        self.clear_cache_btn = ttk.Button(
+            actions, text="Cache", command=self._clear_cache, width=10
+        )
+        self.clear_cache_btn.pack(anchor="w", pady=(6, 0))
 
         results = ttk.LabelFrame(right, text="File caricati", padding=8)
         results.pack(fill="both", expand=True)
@@ -169,8 +179,13 @@ class App:
             style="Accent.Horizontal.TProgressbar",
         )
         self.progress.pack(fill="x", pady=(0, 6))
-        ttk.Label(footer, textvariable=self.status_var, foreground=self._muted).pack(
-            anchor="w"
+        status_row = ttk.Frame(footer)
+        status_row.pack(fill="x")
+        ttk.Label(status_row, textvariable=self.status_var, foreground=self._muted).pack(
+            side="left", anchor="w"
+        )
+        ttk.Label(status_row, textvariable=self.eta_var, foreground=self._muted).pack(
+            side="right", anchor="e"
         )
 
         self._set_busy(False)
@@ -186,6 +201,7 @@ class App:
         self.load_single_btn.configure(state=state)
         self.load_folder_btn.configure(state=state)
         self.convert_btn.configure(state=state if self._has_convertible() else "disabled")
+        self.clear_cache_btn.configure(state=state)
         self.stop_btn.configure(state="normal" if busy else "disabled")
 
     def _has_convertible(self) -> bool:
@@ -196,6 +212,13 @@ class App:
             self.stop_event.set()
             self.status_var.set("Stop richiesto...")
             self._log("Stop richiesto.")
+
+    def _clear_cache(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        removed = page_cache.clear_cache_dir()
+        self._log(f"Cache pulita ({removed} file).")
+        messagebox.showinfo("Cache", f"Cache pulita ({removed} file).")
 
     def _pick_file(self) -> str:
         return filedialog.askopenfilename(
@@ -244,8 +267,10 @@ class App:
         )
         self.scan_results = []
         self._row_items = []
+        self._cached_pages_map = {}
         self._clear_tree()
         self._reset_progress(len(targets))
+        self._reset_eta("scan")
         self.status_var.set(f"Caricati {len(targets)} file. Avvio analisi...")
         self._log(f"Avvio analisi su {len(targets)} file.")
 
@@ -282,6 +307,7 @@ class App:
                 )
                 triage_result.source_file = display_name
                 triage_result.source_path = str(pdf_path)
+                self._cached_pages_map[str(pdf_path)] = cached_pages
             except Exception as exc:
                 triage_result = TriageResult(
                     source_file=display_name,
@@ -318,6 +344,7 @@ class App:
             input_root=str(config.INPUT_DIR), run_type="convert"
         )
         self._reset_progress(len(targets))
+        self._reset_eta("convert")
         self.status_var.set(f"Conversione {len(targets)} file...")
         self._log(f"Conversione {len(targets)} file.")
         self._set_busy(True)
@@ -337,6 +364,7 @@ class App:
                 pdf_path=result.source_path,
                 output_dir=str(Path(config.OUTPUT_DIR)),
                 ocr=False,
+                cached_pages=self._cached_pages_map.get(result.source_path),
                 run_debug=self._run_debug,
             )
             converted_result.source_file = result.source_file
@@ -386,6 +414,41 @@ class App:
             item_id, values=(result.source_file, decision, parser, note), tags=(tag,)
         )
 
+    def _reset_eta(self, stage: str) -> None:
+        self._eta_stage = stage
+        self._eta_start = None
+        self._eta_seconds = None
+        self.eta_var.set("ETA --:--")
+
+    def _update_eta(self, processed: int, total: int, stage: str) -> None:
+        if total <= 0 or processed <= 0:
+            return
+        now = time.monotonic()
+        if self._eta_stage != stage or self._eta_start is None:
+            self._eta_stage = stage
+            self._eta_start = now
+            self._eta_seconds = None
+        elapsed = max(0.0, now - self._eta_start)
+        avg = elapsed / max(1, processed)
+        remaining = max(0.0, (total - processed) * avg)
+        if self._eta_seconds is None:
+            self._eta_seconds = remaining
+        else:
+            self._eta_seconds = self._eta_seconds * 0.7 + remaining * 0.3
+        self.eta_var.set(f"ETA {self._format_eta()}")
+
+    def _format_eta(self) -> str:
+        if self._eta_seconds is None:
+            return "--:--"
+        seconds = int(round(self._eta_seconds))
+        if seconds < 0:
+            return "--:--"
+        minutes, sec = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{sec:02d}"
+        return f"{minutes:02d}:{sec:02d}"
+
     def _set_progress_target(self, value: int, total: int) -> None:
         self.progress["maximum"] = max(1, total)
         self._progress_target = min(value, total)
@@ -429,6 +492,9 @@ class App:
             if kind == "progress":
                 _, processed, total, filename, stage = item
                 self._set_progress_target(processed, total)
+                if processed == 0:
+                    self._reset_eta(stage)
+                self._update_eta(processed, total, stage)
                 if stage == "convert":
                     self.status_var.set(f"Conversione {filename} ({processed}/{total})")
                 else:
@@ -443,6 +509,7 @@ class App:
                 if len(results) == len(self.scan_results):
                     self.scan_results = results
                 self._write_summary()
+                self._reset_eta("")
                 self.status_var.set("Analisi interrotta." if partial else "Analisi completata.")
                 self._set_busy(False)
             elif kind == "convert_result":
@@ -453,6 +520,7 @@ class App:
             elif kind == "convert_done":
                 total, partial = item[1], item[2]
                 self._write_summary()
+                self._reset_eta("")
                 msg = (
                     f"Conversione interrotta ({total} completati)"
                     if partial

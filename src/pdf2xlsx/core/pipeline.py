@@ -4,7 +4,7 @@ import os
 import re
 from pathlib import Path
 from collections import Counter, defaultdict
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pdf2xlsx import config
 from pdf2xlsx.core import extract, normalize, scoring
@@ -22,6 +22,53 @@ ART_NO_VALUE_RE = re.compile(
 )
 LARGE_NUMBER_RE = re.compile(r"\b\d{6,}\b")
 DISCARD_SAMPLE_LIMIT = 5
+CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-./]*")
+MULTI_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
+COLUMN_SPLIT_RE = re.compile(r"\s{2,}|\t")
+LEGAL_MARKER_PATTERNS = [
+    re.compile(r"\bcgv\b", re.IGNORECASE),
+    re.compile(r"\bterms\b", re.IGNORECASE),
+    re.compile(r"\bconditions\b", re.IGNORECASE),
+    re.compile(r"\bterms and conditions\b", re.IGNORECASE),
+    re.compile(r"\bcondizioni generali\b", re.IGNORECASE),
+    re.compile(r"\bdecreto legislativo\b", re.IGNORECASE),
+    re.compile(r"\bdirettiva\b", re.IGNORECASE),
+    re.compile(r"\bcodice civile\b", re.IGNORECASE),
+    re.compile(r"\bwarranty\b", re.IGNORECASE),
+    re.compile(r"\bgaranzia\b", re.IGNORECASE),
+    re.compile(r"\bliability\b", re.IGNORECASE),
+    re.compile(r"responsabilita\b", re.IGNORECASE),
+    re.compile(r"responsabilit\u00e0\b", re.IGNORECASE),
+    re.compile(r"\bjurisdiction\b", re.IGNORECASE),
+    re.compile(r"\bgoverning law\b", re.IGNORECASE),
+    re.compile(r"\barticolo\b", re.IGNORECASE),
+    re.compile(r"\bart\.(?!\s*no)", re.IGNORECASE),
+    re.compile(r"\b(?:ec|ue)\b", re.IGNORECASE),
+    re.compile(r"\u00a7", re.IGNORECASE),
+]
+DIM_LABEL_RE = re.compile(
+    r"\b(prof\.?|larg\.?|alt\.?|profondit[aà]|larghezza|altezza|diametro|dia|diam|depth|width|height|h|w|d|l|o|\u00f8|ø)\b",
+    re.IGNORECASE,
+)
+HEADER_STRICT_KEYWORDS = [
+    "listino",
+    "legenda",
+    "cod.",
+    "codice",
+    "code",
+    "descrizione",
+    "description",
+    "price",
+    "prezzo",
+    "rrp",
+    "art. no",
+    "art no",
+    "designer",
+    "colli",
+    "size",
+    "dimensioni",
+    "dimensions",
+]
 
 
 def run_pipeline(
@@ -78,6 +125,29 @@ def run_pipeline(
         if debug_matches and page.page_number in {2, 3}:
             log_marker_debug(page.page_number, normalized)
         lines = normalize.split_lines(normalized)
+        page_signals = compute_page_signals(lines)
+        LOGGER.info(
+            "PAGE_SIG p=%d parser=%s sig=%s",
+            page.page_number,
+            parser.name,
+            format_page_signals(page_signals),
+        )
+        if is_text_like_page(page_signals, parser.name):
+            LOGGER.warning(
+                "SKIP_PAGE text_like p=%d parser=%s sig=%s",
+                page.page_number,
+                parser.name,
+                format_page_signals(page_signals),
+            )
+            continue
+        page_review_only = is_review_only_page(page_signals)
+        if page_review_only:
+            LOGGER.warning(
+                "REVIEW_PAGE legal_weak_table p=%d parser=%s sig=%s",
+                page.page_number,
+                parser.name,
+                format_page_signals(page_signals),
+            )
 
         section = parser.detect_section(lines)
         if section:
@@ -102,6 +172,7 @@ def run_pipeline(
                     "raw_text": block_text,
                     "ocr_used": page.ocr_used,
                     "notes": notes,
+                    "review_only": page_review_only,
                 }
             )
 
@@ -127,6 +198,17 @@ def run_pipeline(
             normalized_block = normalize.normalize_text(sub_block)
             flat_line = " ".join(normalized_block.split())
             line_info = text_utils.analyze_line(flat_line)
+            token_info = text_utils.resolve_row_fields(flat_line)
+            selected_art_no = token_info.get("selected_art_no") or {}
+            if not row.art_no and selected_art_no:
+                art_no_value = selected_art_no.get("token") if isinstance(selected_art_no, dict) else ""
+                if art_no_value and not token_info.get("ambiguous_numeric"):
+                    row.art_no = art_no_value
+                    row.art_no_raw = art_no_value
+            if not row.product_name_en and token_info.get("name"):
+                row.product_name_en = token_info.get("name") or ""
+            if not row.size_raw and token_info.get("dimension_candidates"):
+                row.size_raw = " | ".join(token_info.get("dimension_candidates") or [])
             discard_reason = primary_discard_reason(
                 parser=parser,
                 row=row,
@@ -134,10 +216,17 @@ def run_pipeline(
                 line_info=line_info,
             )
             if discard_reason:
-                discard_reasons[discard_reason] += 1
-                if len(discard_samples[discard_reason]) < DISCARD_SAMPLE_LIMIT:
-                    discard_samples[discard_reason].append(flat_line[:200])
-                continue
+                if discard_reason == "bad_id" and (
+                    token_info.get("ambiguous_numeric")
+                    or token_info.get("art_no_candidates")
+                    or token_info.get("price_candidates")
+                ):
+                    discard_reason = ""
+                if discard_reason:
+                    discard_reasons[discard_reason] += 1
+                    if len(discard_samples[discard_reason]) < DISCARD_SAMPLE_LIMIT:
+                        discard_samples[discard_reason].append(flat_line[:200])
+                    continue
             confidence, needs_review, notes = scoring.score_row(
                 row=row,
                 size_unparsed=size_unparsed,
@@ -155,6 +244,20 @@ def run_pipeline(
             combined_notes = parse_notes + notes + block.get("notes", [])
             if merged_note:
                 combined_notes.append(merged_note)
+            if token_info.get("dimension_candidates"):
+                combined_notes.append("dim_detected")
+            if token_info.get("price_candidates"):
+                combined_notes.append("price_detected")
+            if token_info.get("art_no_candidates"):
+                combined_notes.append("artno_detected")
+            if token_info.get("ambiguous_numeric"):
+                row.exported = False
+                row.needs_review = True
+                combined_notes.append("ambiguous_price_vs_artno")
+            if block.get("review_only"):
+                row.exported = False
+                row.needs_review = True
+                combined_notes.append("page_review_only")
             art_line = ""
             matched_art_no = ""
             first_large_number_token = ""
@@ -243,14 +346,45 @@ def run_pipeline(
                 invalid_reasons.append("invalid_chunk_missing_price")
             if not row.product_name_en:
                 invalid_reasons.append("invalid_chunk_missing_name")
+            if not token_info.get("price_candidates") and not token_info.get("art_no_candidates"):
+                invalid_reasons.append("no_price_no_artno")
             if invalid_reasons:
                 row.exported = False
                 row.needs_review = True
                 combined_notes.extend(invalid_reasons)
 
+            hard_ok, hard_reason = hard_validate_row(
+                row=row,
+                raw_text=flat_line,
+                line_info=line_info,
+                token_info=token_info,
+            )
+            if not hard_ok:
+                row.exported = False
+                row.needs_review = True
+                combined_notes.append(hard_reason)
+                if hard_reason in {"hard_legal", "dim_only_row", "header_like_strict"}:
+                    row.confidence = min(row.confidence, 0.3)
+                LOGGER.warning(
+                    "HARD_FAIL_ROW reason=%s art_no=%s page=%s parser=%s snippet=%s",
+                    hard_reason,
+                    row.art_no or "",
+                    row.page or "",
+                    parser.name,
+                    flat_line[:160],
+                )
+
             if is_degraded_art_no(sub_block, row.art_no):
                 combined_notes.append("art_no_degraded")
                 row.needs_review = True
+
+            if any(
+                reason in combined_notes
+                for reason in ("hard_legal", "dim_only_row", "header_like_strict")
+            ):
+                row.confidence = min(row.confidence, 0.3)
+                row.needs_review = True
+                row.exported = False
 
             row.notes = "; ".join(unique_notes(combined_notes))
             if force_review:
@@ -558,6 +692,213 @@ def row_has_price(row: ProductRow) -> bool:
         price is not None
         for price in (row.price_eur, row.price_dkk, row.price_sek, row.price_nok)
     )
+
+
+def compute_page_signals(lines: List[str]) -> Dict[str, object]:
+    text = " ".join(lines)
+    numeric_density = _numeric_density(text)
+    price_like_count = 0
+    cooccurrence_count = 0
+    for line in lines:
+        if not line:
+            continue
+        line_info = text_utils.analyze_line(line)
+        price_like = bool(line_info.get("price_like"))
+        if price_like:
+            price_like_count += 1
+        if price_like and _line_has_plausible_code(line):
+            cooccurrence_count += 1
+    legal_hits = count_legal_markers(text)
+    table_hint = _table_hint_from_lines(lines)
+    table_columns = estimate_table_columns(lines)
+    return {
+        "numeric_density": numeric_density,
+        "price_like_count": price_like_count,
+        "cooccurrence_count": cooccurrence_count,
+        "legal_hits": legal_hits,
+        "table_hint": table_hint,
+        "table_columns": table_columns,
+    }
+
+
+def format_page_signals(signals: Dict[str, object]) -> str:
+    return (
+        f"density={signals.get('numeric_density', 0.0):.3f} "
+        f"price_like={signals.get('price_like_count', 0)} "
+        f"cooc={signals.get('cooccurrence_count', 0)} "
+        f"legal={signals.get('legal_hits', 0)} "
+        f"table_hint={bool(signals.get('table_hint'))} "
+        f"table_cols={signals.get('table_columns', 0)}"
+    )
+
+
+def is_text_like_page(signals: Dict[str, object], parser_name: str) -> bool:
+    cooc = int(signals.get("cooccurrence_count", 0) or 0)
+    price_like_count = int(signals.get("price_like_count", 0) or 0)
+    numeric_density = float(signals.get("numeric_density", 0.0) or 0.0)
+    legal_hits = int(signals.get("legal_hits", 0) or 0)
+    table_hint = bool(signals.get("table_hint"))
+    table_columns = int(signals.get("table_columns", 0) or 0)
+
+    if cooc == 0 and price_like_count < 2 and numeric_density < 0.08:
+        return True
+    if legal_hits >= 2 and cooc == 0 and price_like_count < 3:
+        return True
+    if parser_name == "table_based" and not table_hint and table_columns < 3:
+        return True
+    return False
+
+
+def is_review_only_page(signals: Dict[str, object]) -> bool:
+    legal_hits = int(signals.get("legal_hits", 0) or 0)
+    cooc = int(signals.get("cooccurrence_count", 0) or 0)
+    table_hint = bool(signals.get("table_hint"))
+    if legal_hits >= 2 and (cooc < 2 or not table_hint):
+        return True
+    return False
+
+
+def hard_validate_row(
+    row: ProductRow,
+    raw_text: str,
+    line_info: Dict[str, object],
+    token_info: Optional[Dict[str, object]] = None,
+) -> Tuple[bool, str]:
+    if looks_like_legal_text(raw_text):
+        return False, "hard_legal"
+    if token_info and is_dimension_only_row(raw_text, token_info):
+        return False, "dim_only_row"
+    if is_header_like_strict(raw_text):
+        return False, "header_like_strict"
+    art_no = text_utils.canonicalize_art_no(row.art_no or "")
+    if not art_no:
+        return False, "hard_art_no"
+    has_alpha = bool(re.search(r"[A-Za-z]", art_no))
+    has_digit = bool(re.search(r"\d", art_no))
+    digits_only = re.sub(r"\D", "", art_no)
+    if not has_digit:
+        return False, "hard_art_no_shape"
+    if not has_alpha:
+        if token_info and token_info.get("ambiguous_numeric"):
+            return False, "ambiguous_price_vs_artno"
+        if len(digits_only) < 3 or len(digits_only) > 10:
+            return False, "hard_art_no_len"
+    if has_alpha and (len(art_no) < 4 or len(art_no) > 24):
+        return False, "hard_art_no_len"
+
+    if not row_has_price(row):
+        return False, "hard_no_price"
+
+    name = (row.product_name_en or "").strip()
+    if not name:
+        return False, "hard_no_name"
+    if len(name) < 3 or len(name) > 90:
+        return False, "hard_name_len"
+    alpha_count = sum(1 for char in name if char.isalpha())
+    if alpha_count < 3:
+        return False, "hard_name_alpha"
+
+    return True, ""
+
+
+def looks_like_legal_text(raw_text: str) -> bool:
+    if not raw_text:
+        return False
+    hits = count_legal_markers(raw_text)
+    if hits >= 2:
+        return True
+    if hits >= 1 and len(raw_text) > 220:
+        punct_hits = sum(raw_text.count(token) for token in (";", ":", "\u00a7"))
+        if punct_hits >= 2:
+            return True
+    return False
+
+
+def count_legal_markers(raw_text: str) -> int:
+    if not raw_text:
+        return 0
+    hits = 0
+    for pattern in LEGAL_MARKER_PATTERNS:
+        if pattern.search(raw_text):
+            hits += 1
+    return hits
+
+
+def is_dimension_only_row(raw_text: str, token_info: Dict[str, object]) -> bool:
+    if not raw_text:
+        return False
+    name = token_info.get("name") or ""
+    raw_name_tokens = [token for token in name.split() if re.search(r"[A-Za-z]", token)]
+    name_tokens = [token for token in raw_name_tokens if not DIM_LABEL_RE.search(token)]
+    name_alpha_count = sum(
+        1 for token in name_tokens for char in token if char.isalpha()
+    )
+    has_dim_candidate = bool(token_info.get("dimension_candidates"))
+    has_dim_label = bool(DIM_LABEL_RE.search(raw_text))
+    if not (has_dim_candidate or has_dim_label):
+        return False
+    if len(name_tokens) >= 2:
+        return False
+    return name_alpha_count < 4
+
+
+def is_header_like_strict(raw_text: str) -> bool:
+    if not raw_text:
+        return False
+    lowered = raw_text.lower()
+    hits = sum(1 for keyword in HEADER_STRICT_KEYWORDS if keyword in lowered)
+    if hits >= 2:
+        return True
+    if hits >= 1 and len(raw_text) <= 60:
+        return True
+    return False
+
+
+def _line_has_plausible_code(line: str) -> bool:
+    for token in CODE_TOKEN_RE.findall(line or ""):
+        if text_utils.is_plausible_code(token, min_len=config.CODE_MIN_LEN):
+            return True
+    return False
+
+
+def _numeric_density(text: str) -> float:
+    if not text:
+        return 0.0
+    digits = sum(1 for char in text if char.isdigit())
+    return digits / len(text) if text else 0.0
+
+
+def _table_hint_from_lines(lines: List[str]) -> bool:
+    if not lines:
+        return False
+    numeric_lines = 0
+    spaced_lines = 0
+    for line in lines:
+        if not line:
+            continue
+        if len(MULTI_NUMBER_RE.findall(line)) >= 2:
+            numeric_lines += 1
+        if "  " in line:
+            spaced_lines += 1
+    total = len(lines)
+    numeric_ratio = numeric_lines / total if total else 0.0
+    spaced_ratio = spaced_lines / total if total else 0.0
+    if numeric_ratio >= config.TABLE_WORDS_HINT_MIN_RATIO:
+        return True
+    if spaced_ratio >= config.TABLE_WORDS_HINT_MIN_SPACE_RATIO:
+        return True
+    return False
+
+
+def estimate_table_columns(lines: List[str]) -> int:
+    max_columns = 0
+    for line in lines:
+        if not line:
+            continue
+        parts = [part.strip() for part in COLUMN_SPLIT_RE.split(line) if part.strip()]
+        if len(parts) > max_columns:
+            max_columns = len(parts)
+    return max_columns
 
 
 def primary_discard_reason(parser, row: ProductRow, raw_text: str, line_info: Dict[str, object]) -> str:
