@@ -421,6 +421,9 @@ def run_pipeline(
             if noise_reason:
                 discard_reasons[noise_reason] += 1
                 guardrail_counts["noise_rows"] += 1
+                guardrail_counts["noise_total"] += 1
+                if noise_reason == "noise_header_eur1":
+                    guardrail_counts["eur_1_kills"] += 1
                 if len(discard_samples[noise_reason]) < DISCARD_SAMPLE_LIMIT:
                     discard_samples[noise_reason].append(flat_line[:200])
                 continue
@@ -646,6 +649,8 @@ def run_pipeline(
         "filtered_single_letter_code",
         "year_price_blocked",
         "noise_rows",
+        "noise_total",
+        "eur_1_kills",
         "table_stitcher_used_pages",
         "table_stitcher_rows_built",
         "table_stitcher_rows_exported",
@@ -698,6 +703,12 @@ def build_report(
     duplicate_summary = analyze_duplicates(rows, target_currency)
     art_no_quality = analyze_art_no_quality(rows)
     review_reasons = analyze_review_reasons(rows)
+    noise_by_reason = {
+        key: value for key, value in discard_reasons.items() if key.startswith("noise_")
+    }
+    guardrail_counts["noise_by_reason"] = noise_by_reason
+    if guardrail_counts.get("noise_total", 0) == 0:
+        guardrail_counts["noise_total"] = sum(noise_by_reason.values())
 
     report = RunReport(
         rows=rows,
@@ -1023,6 +1034,11 @@ def is_text_like_page(signals: Dict[str, object], parser_name: str) -> bool:
     legal_hits = int(signals.get("legal_hits", 0) or 0)
     table_hint = bool(signals.get("table_hint"))
     table_columns = int(signals.get("table_columns", 0) or 0)
+    row_candidates = int(signals.get("row_candidate_count", 0) or 0)
+    mixed_code = int(signals.get("mixed_code_count", 0) or 0)
+
+    if row_candidates > 0 or mixed_code > 0:
+        return False
 
     if cooc == 0 and price_like_count < 2 and numeric_density < 0.08:
         return True
@@ -1143,6 +1159,58 @@ def is_header_like_strict(raw_text: str) -> bool:
     return False
 
 
+def _count_titlecase_tokens(tokens: List[str]) -> int:
+    count = 0
+    for token in tokens:
+        if re.match(r"^[A-Z][a-z]+$", token):
+            count += 1
+    return count
+
+
+def _has_header_legend_tokens(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    keywords = [
+        "code",
+        "description",
+        "finish",
+        "price",
+        "prezzo",
+        "notes",
+        "note",
+        "eur",
+        "w",
+        "d",
+        "h",
+        "volume",
+    ]
+    hits = sum(1 for keyword in keywords if keyword in lowered)
+    return hits >= 2
+
+
+def _is_eur_one_header(
+    raw_text: str,
+    token_info: Dict[str, object],
+    line_info: Dict[str, object],
+) -> bool:
+    if not raw_text:
+        return False
+    if "EUR" not in raw_text.upper() and "\u20ac" not in raw_text:
+        return False
+    if not line_info.get("has_currency"):
+        return False
+    candidates = token_info.get("price_candidates") or []
+    if not candidates:
+        return False
+    values = [item.get("value") for item in candidates if isinstance(item.get("value"), (int, float))]
+    if not values:
+        return False
+    if max(values) > 3:
+        return False
+    return True
+
+
 def classify_noise_row(
     row: ProductRow,
     raw_text: str,
@@ -1160,13 +1228,45 @@ def classify_noise_row(
     tokens = text_utils.tokenize_line(raw_text)
     alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]", token))
     alpha_chars = sum(1 for char in raw_text if char.isalpha())
+    titlecase_tokens = _count_titlecase_tokens(tokens)
+    number_tokens = [int(token) for token in tokens if token.isdigit()]
+    has_index_number = any(10 <= num <= 250 for num in number_tokens)
+    has_art_candidates = bool(token_info.get("art_no_candidates"))
+    has_currency = bool(line_info.get("has_currency"))
 
     if not valid_art_no and line_info.get("toc_year_price"):
         return "noise_toc_line"
     if not valid_art_no and text_utils.is_toc_like_line(raw_text):
         return "noise_toc_line"
+    if not valid_art_no and titlecase_tokens >= 2 and has_index_number:
+        if not has_currency and not has_art_candidates:
+            return "noise_index"
     if not valid_art_no and is_header_like_strict(raw_text):
-        return "noise_header"
+        return "noise_header_legend"
+    if not valid_art_no and _has_header_legend_tokens(raw_text):
+        return "noise_header_legend"
+    if valid_art_no and _has_header_legend_tokens(raw_text) and alpha_tokens < 2:
+        return "noise_header_legend"
+    if valid_art_no and _is_eur_one_header(raw_text, token_info, line_info):
+        return "noise_header_eur1"
+    if not valid_art_no and ("extra charge" in raw_text.lower() or "treatment" in raw_text.lower()):
+        if len(tokens) >= 6:
+            return "noise_accessory_note"
+    if not valid_art_no and ("anti-stain" in raw_text.lower() or "antistain" in raw_text.lower()):
+        return "noise_accessory_note"
+    if not valid_art_no and re.search(r"\b(cat\.?|category)\b", raw_text, re.IGNORECASE):
+        return "noise_material_metric"
+    if not valid_art_no and re.search(r"\b(sq\.?\s*m|sqm|mq)\b", raw_text, re.IGNORECASE):
+        return "noise_material_metric"
+    if not valid_art_no and re.search(r"\b(peso|weight|volume)\b", raw_text, re.IGNORECASE):
+        return "noise_weight_dim"
+    if not valid_art_no and re.search(r"\bL[1-3]\b", raw_text):
+        return "noise_weight_dim"
+    if "×" in raw_text or re.search(r"\b\d+\s*[xX]\b", raw_text):
+        if len(token_info.get("art_no_candidates") or []) >= 2:
+            return "noise_composition"
+    if len(token_info.get("art_no_candidates") or []) >= 2:
+        return "noise_composition"
     if not valid_art_no and (token_info.get("dimension_candidates") or line_info.get("dimension_line")):
         if not price_like:
             return "noise_dimension_block"
@@ -1351,6 +1451,7 @@ def apply_duplicate_policy(
             row = item["row"]
             line_info = item["line_info"]
             price_like = item["price_like"]
+            header_like = is_header_like_strict(item["line_text"])
             if line_info.get("dimension_line") and not price_like:
                 reason = "technical_sheet_line"
                 row.needs_review = False
@@ -1366,10 +1467,18 @@ def apply_duplicate_policy(
                 if guardrail_counts is not None:
                     guardrail_counts["noise_rows"] += 1
             else:
-                reason = "duplicate_variant"
-                row.exported = True
-                row.needs_review = False
-                add_row_note(row, "SOFT_REVIEW:duplicate_variant")
+                if row.noise or header_like:
+                    reason = "header_noise_conflict"
+                    row.exported = False
+                    row.needs_review = False
+                    row.noise = True
+                    if guardrail_counts is not None:
+                        guardrail_counts["noise_rows"] += 1
+                else:
+                    reason = "real_price_conflict"
+                    row.exported = True
+                    row.needs_review = False
+                    add_row_note(row, "SOFT_REVIEW:duplicate_variant")
             add_row_note(row, reason)
             variant_reasons[reason] += 1
             if len(variant_samples) < 3:

@@ -253,7 +253,9 @@ def _inject_report_summary(cache_meta: dict, report) -> dict:
     meta["rows_review"] = int(getattr(report, "rows_needs_review", 0) or 0)
     guardrail_counts = getattr(report, "guardrail_counts", {}) or {}
     meta["guardrail_counts"] = guardrail_counts
-    meta["rows_noise"] = int(guardrail_counts.get("noise_rows", 0) or 0)
+    meta["rows_noise"] = int(
+        guardrail_counts.get("noise_total", guardrail_counts.get("noise_rows", 0)) or 0
+    )
     config_info = getattr(report, "config_info", {}) or {}
     if config_info.get("export_policy_mode"):
         meta["export_policy_mode"] = config_info.get("export_policy_mode")

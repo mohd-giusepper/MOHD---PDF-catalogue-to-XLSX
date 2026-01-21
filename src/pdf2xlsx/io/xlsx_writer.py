@@ -102,6 +102,9 @@ def write_diagnostic_summary(
     summary_sheet.append(["rows_noise", cache_meta.get("rows_noise", 0)])
     guardrail_counts = cache_meta.get("guardrail_counts", {}) or {}
     summary_sheet.append(
+        ["noise_total", guardrail_counts.get("noise_total", cache_meta.get("rows_noise", 0))]
+    )
+    summary_sheet.append(
         ["year_price_blocked", guardrail_counts.get("year_price_blocked", 0)]
     )
     summary_sheet.append(
@@ -121,6 +124,9 @@ def write_diagnostic_summary(
     )
     summary_sheet.append(
         ["filtered_single_letter_code", guardrail_counts.get("filtered_single_letter_code", 0)]
+    )
+    summary_sheet.append(
+        ["eur_1_kills", guardrail_counts.get("eur_1_kills", 0)]
     )
     summary_sheet.append(
         ["table_stitcher_used_pages", guardrail_counts.get("table_stitcher_used_pages", 0)]

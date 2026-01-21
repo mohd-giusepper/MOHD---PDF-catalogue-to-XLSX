@@ -701,7 +701,7 @@ def count_plausible_code_tokens(text: str) -> int:
         return 0
     tokens = tokenize_line(text)
     return sum(
-        1 for token in tokens if is_plausible_code(token, min_len=5)
+        1 for token in tokens if is_plausible_code(token, min_len=6)
     )
 
 

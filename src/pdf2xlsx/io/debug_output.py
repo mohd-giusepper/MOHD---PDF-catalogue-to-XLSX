@@ -140,9 +140,14 @@ def build_debug_payload(
         "rows_exported": triage_result.rows_exported or 0,
         "review_rows": triage_result.review_rows or 0,
         "rows_review": triage_result.review_rows or 0,
-        "rows_noise": getattr(report, "guardrail_counts", {}).get("noise_rows", 0)
-        if report
-        else 0,
+        "rows_noise": (
+            getattr(report, "guardrail_counts", {}).get(
+                "noise_total",
+                getattr(report, "guardrail_counts", {}).get("noise_rows", 0),
+            )
+            if report
+            else 0
+        ),
         "review_rate": triage_result.review_rate or 0.0,
         "duplicates_count": triage_result.duplicate_conflicts_count or 0,
         "skipped_missing_currency_count": triage_result.rows_skipped_missing_target_currency or 0,

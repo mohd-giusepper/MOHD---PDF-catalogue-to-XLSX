@@ -249,6 +249,38 @@ class GuardrailTests(unittest.TestCase):
         noise_reason = pipeline.classify_noise_row(row, raw_text, line_info, token_info)
         self.assertEqual(noise_reason, "noise_price_only")
 
+    def test_index_line_goes_to_noise(self) -> None:
+        raw_text = "Gian & Pan 103"
+        line_info = text_utils.analyze_line(raw_text)
+        token_info = text_utils.resolve_row_fields(raw_text)
+        row = ProductRow(product_name_en="Gian & Pan", art_no="", price_eur=None)
+        noise_reason = pipeline.classify_noise_row(row, raw_text, line_info, token_info)
+        self.assertEqual(noise_reason, "noise_index")
+
+    def test_weight_line_goes_to_noise(self) -> None:
+        raw_text = "Peso L1 5.160"
+        line_info = text_utils.analyze_line(raw_text)
+        token_info = text_utils.resolve_row_fields(raw_text)
+        row = ProductRow(product_name_en="", art_no="", price_eur=None)
+        noise_reason = pipeline.classify_noise_row(row, raw_text, line_info, token_info)
+        self.assertEqual(noise_reason, "noise_weight_dim")
+
+    def test_eur_one_header_goes_to_noise(self) -> None:
+        raw_text = "0BTTEL110 EUR 1"
+        line_info = text_utils.analyze_line(raw_text)
+        token_info = text_utils.resolve_row_fields(raw_text)
+        row = ProductRow(product_name_en="", art_no="0BTTEL110", price_eur=1.0)
+        noise_reason = pipeline.classify_noise_row(row, raw_text, line_info, token_info)
+        self.assertEqual(noise_reason, "noise_header_eur1")
+
+    def test_composition_line_goes_to_noise(self) -> None:
+        raw_text = "1 × corner module 0BTTEA110 2 × central module 0BTTEL110"
+        line_info = text_utils.analyze_line(raw_text)
+        token_info = text_utils.resolve_row_fields(raw_text)
+        row = ProductRow(product_name_en="", art_no="", price_eur=None)
+        noise_reason = pipeline.classify_noise_row(row, raw_text, line_info, token_info)
+        self.assertEqual(noise_reason, "noise_composition")
+
     def test_writer_exports_only_exported_rows(self) -> None:
         rows = [
             ProductRow(
